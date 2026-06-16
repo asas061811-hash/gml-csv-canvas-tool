@@ -1,0 +1,44 @@
+# ===================================================
+# 重要：以下目錄與檔案不會上傳 GitHub
+# 請勿將公司 CSV、成果座標檔、判讀紀錄上傳至公開儲存庫
+# ===================================================
+
+# 輸入 CSV（廠商提供的實測資料，含座標，絕對不能公開）
+# 用 input_csv/* 而非 input_csv/，以便保留 .gitkeep 佔位檔
+input_csv/*
+!input_csv/.gitkeep
+
+# 程式輸出（含座標、點位、判讀結果等敏感資料）
+output/*
+!output/.gitkeep
+
+# 所有 CSV、Excel、ZIP 檔（無論放在哪個目錄）
+*.csv
+*.xlsx
+*.xls
+*.zip
+
+# Python 編譯快取
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 環境變數與機密設定
+.env
+.env.*
+
+# 虛擬環境
+venv/
+.venv/
+env/
+
+# 作業系統雜項
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE 設定
+.vscode/
+.idea/
+*.swp
+*.swo
