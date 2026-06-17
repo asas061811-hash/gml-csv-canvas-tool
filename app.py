@@ -18,12 +18,10 @@ import pandas as pd
 import plotly.io as pio
 import streamlit as st
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
-
-from anomaly_detector import detect_anomalies
-from canvas_generator import build_figure          # v2 相容，下載 HTML 仍可用
-from csv_loader import load_uploaded_csvs
-from excel_exporter import (
+from src.anomaly_detector import detect_anomalies
+from src.canvas_generator import build_figure          # v2 相容，下載 HTML 仍可用
+from src.csv_loader import load_uploaded_csvs
+from src.excel_exporter import (
     CORRECTION_HEADERS,
     _export_to_bytes,
     export_anomalies,
@@ -32,8 +30,8 @@ from excel_exporter import (
     export_parsed_points,
     export_review_template,
 )
-from id_parser import parse_all_ids
-from v3_helpers import (
+from src.id_parser import parse_all_ids
+from src.v3_helpers import (
     FACILITY_SCHEMAS,
     FACILITY_TYPES,
     INCLUDE_RESULT_OPTIONS,
