@@ -40,16 +40,20 @@ from v3_helpers import (
     PROBLEM_TYPE_OPTIONS,
     REVIEW_STATUS_OPTIONS,
     build_classification_df,
+    build_cls_pkey_list,
     build_figure_v3,
     clear_all_edits,
     count_pipelines,
     decode_category,
+    exclude_points,
+    export_classification_bytes,
     export_v3_bytes,
     extract_point_key,
     get_facility_type,
     init_edit_log,
     init_edited_points_df,
     quick_mark,
+    restore_excluded,
     restore_point,
     save_point_edit,
 )
@@ -88,6 +92,52 @@ def _v(val):
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return ''
     return str(val)
+
+
+def _is_excl(row):
+    """判斷該點位列是否已排除（include_in_result=否 或 review_status=排除）。"""
+    return (str(row.get('include_in_result', '是')) == '否' or
+            str(row.get('review_status', '')) == '排除')
+
+
+def _excl_del_ui(tab_key, edf_raw, pkey_list, label='排除勾選資料'):
+    """
+    共用的「勾選排除」確認 UI（確認對話框）。
+    tab_key: 唯一識別此 tab 的字串（用於 session_state key 區隔）。
+    pkey_list: 與 data_editor 同順序的 point_key 清單。
+    回傳：to_excl 清單（目前勾選的 point_keys，尚未執行排除）。
+    """
+    confirm_key = f'confirm_excl_{tab_key}'
+    pending_key = f'pending_excl_{tab_key}'
+
+    # 讀取目前確認狀態
+    if st.session_state.get(confirm_key) and st.session_state.get(pending_key):
+        pending = st.session_state[pending_key]
+        st.warning(
+            f'⚠️ 確定排除 **{len(pending)}** 筆資料？'
+            '將標記為「排除、不納入成果」，可在修正紀錄追溯並還原。'
+        )
+        c1, c2 = st.columns(2)
+        if c1.button('✅ 確認排除', key=f'{tab_key}_yes', type='primary',
+                     use_container_width=True):
+            new_edf, new_log = exclude_points(
+                st.session_state.edited_points_df,
+                st.session_state.edit_log_df,
+                pending,
+            )
+            st.session_state.edited_points_df = new_edf
+            st.session_state.edit_log_df      = new_log
+            st.session_state[confirm_key]      = False
+            st.session_state[pending_key]      = []
+            st.toast(f'🗑️ 已排除 {len(pending)} 筆', icon='🗑️')
+            st.rerun()
+        if c2.button('❌ 取消', key=f'{tab_key}_no', use_container_width=True):
+            st.session_state[confirm_key] = False
+            st.session_state[pending_key] = []
+            st.rerun()
+        return []
+
+    return pkey_list   # 外部自行判斷哪些被勾選後呼叫
 
 
 def make_anomaly_styler(anom_df):
@@ -407,6 +457,11 @@ def main():
         ('xy_tol_used',       DEFAULT_XY_TOL),
         ('z_tol_used',        DEFAULT_Z_TOL),
         ('canvas_revision',   'init'),
+        ('show_excluded',     False),
+        ('confirm_excl_tab0', False),
+        ('pending_excl_tab0', []),
+        ('confirm_excl_cls',  False),
+        ('pending_excl_cls',  []),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -483,10 +538,22 @@ def main():
             c2.metric('管線數', n_pipe)
             c1.metric('異常筆數', len(al))
             c2.metric('重複記錄', len(dl))
-            st.caption('管線數依「管線識別碼」唯一值統計（含已排除，空白不計）')
+            n_excl_sb = int(edf.apply(_is_excl, axis=1).sum())
+            st.caption(
+                f'管線數依「管線識別碼」唯一值統計（空白不計）　'
+                f'已排除 {n_excl_sb} 筆'
+            )
             n_mod = int(edf['is_modified'].sum())
             if n_mod:
                 st.info(f'⚙️ 已修正 {n_mod} 個點位')
+            # ── 顯示排除資料切換開關 ─────────────────
+            st.divider()
+            st.session_state.show_excluded = st.toggle(
+                '顯示排除資料',
+                value=st.session_state.get('show_excluded', False),
+                help='開啟後，畫布與表格將顯示已排除的點位（灰色）',
+                key='sidebar_show_excl',
+            )
             if st.session_state.load_errors:
                 st.warning(f'{len(st.session_state.load_errors)} 個檔案讀取失敗')
 
@@ -588,6 +655,7 @@ def main():
             selected_key=st.session_state.selected_key,
             canvas_height=580,
             uirevision=st.session_state.canvas_revision,
+            show_excluded=st.session_state.get('show_excluded', False),
         )
 
         event = st.plotly_chart(
@@ -656,37 +724,85 @@ def main():
 
     # ── Tab 0：修正後點位表 ─────────────────────────
     with tabs[0]:
+        show_excl = st.session_state.get('show_excluded', False)
+        edf_raw   = st.session_state.edited_points_df
+        edf_filt  = edf_raw if show_excl else edf_raw[~edf_raw.apply(_is_excl, axis=1)]
+        pkeys_t0  = edf_filt['point_key'].tolist()
+
+        _SRC_COLS  = ['_source_file','_original_row','raw_id','edited_raw_id',
+                      'edited_category','edited_pipeline_id','edited_point_no',
+                      'edited_x','edited_y','edited_z','edited_date',
+                      'review_status','problem_type','manual_note','include_in_result','is_modified']
+        _DISP_COLS = ['來源CSV','列號','原始識別碼','識別碼','類別碼','管線識別碼','點號',
+                      'X','Y','Z','測量日期','判讀狀態','問題類型','備註','納入成果','已修正']
+
+        ed_df = edf_filt[_SRC_COLS].copy().reset_index(drop=True)
+        ed_df.columns = _DISP_COLS
+        ed_df['已修正'] = ed_df['已修正'].apply(lambda v: '⚙️' if v else '')
+        ed_df.insert(0, '刪除', False)
+
         st.subheader('修正後點位表')
-        st.caption('橘底 = 已人工修正；灰底 = 已排除')
-
-        edf_disp = st.session_state.edited_points_df[[
-            '_source_file', '_original_row', 'raw_id',
-            'edited_raw_id', 'edited_category',
-            'edited_pipeline_id', 'edited_point_no',
-            'edited_x', 'edited_y', 'edited_z', 'edited_date',
-            'review_status', 'problem_type', 'manual_note', 'include_in_result', 'is_modified',
-        ]].copy()
-        edf_disp.columns = [
-            '原始來源CSV', '原始列號', '原始識別碼',
-            '識別碼', '類別碼', '管線識別碼', '點號',
-            'X', 'Y', 'Z', '測量日期',
-            '判讀狀態', '問題類型', '備註', '納入成果', '已修正',
-        ]
-        edf_disp['已修正'] = edf_disp['已修正'].apply(lambda v: '⚙️' if v else '')
-
-        def _style_edited(row):
-            if row.get('納入成果') == '否' or row.get('判讀狀態') == '排除':
-                return ['background-color: #f2f3f4; color: #888'] * len(row)
-            if row.get('已修正') == '⚙️':
-                return ['background-color: #fef9e7'] * len(row)
-            return [''] * len(row)
-
-        st.dataframe(
-            edf_disp.style.apply(_style_edited, axis=1),
-            use_container_width=True, hide_index=True,
+        n_all_t0  = len(edf_raw)
+        n_excl_t0 = int(edf_raw.apply(_is_excl, axis=1).sum())
+        n_mod_t0  = int(edf_raw['is_modified'].sum())
+        st.caption(
+            f'顯示 **{len(edf_filt)}** / {n_all_t0} 筆　'
+            f'已排除 **{n_excl_t0}** 筆{"（已顯示）" if show_excl else "（已隱藏，可在側邊欄開啟）"}　'
+            f'已修正 **{n_mod_t0}** 筆　｜　'
+            '勾選「🗑️」列後點擊下方按鈕排除；⚙️ = 已修正'
         )
-        n_mod_t = int(st.session_state.edited_points_df['is_modified'].sum())
-        st.caption(f'共 {len(edf_disp)} 筆　已修正 {n_mod_t} 筆')
+
+        edited_t0 = st.data_editor(
+            ed_df,
+            column_config={'刪除': st.column_config.CheckboxColumn('🗑️', default=False,
+                                                                    help='勾選欲排除的列')},
+            disabled=[c for c in ed_df.columns if c != '刪除'],
+            hide_index=True,
+            use_container_width=True,
+            key='tab0_editor',
+        )
+
+        checked_t0 = [i for i, v in enumerate(edited_t0['刪除'].tolist()) if v]
+        to_excl_t0 = [pkeys_t0[i] for i in checked_t0 if i < len(pkeys_t0)]
+
+        # 確認對話框
+        if st.session_state.get('confirm_excl_tab0') and st.session_state.get('pending_excl_tab0'):
+            pending_t0 = st.session_state['pending_excl_tab0']
+            st.warning(
+                f'⚠️ 確定排除 **{len(pending_t0)}** 筆？'
+                '將標記為「排除、不納入成果」，可在修正紀錄追溯並還原。'
+            )
+            cc1, cc2 = st.columns(2)
+            if cc1.button('✅ 確認排除', key='t0_excl_yes', type='primary',
+                          use_container_width=True):
+                new_edf, new_log = exclude_points(
+                    st.session_state.edited_points_df,
+                    st.session_state.edit_log_df, pending_t0)
+                st.session_state.edited_points_df = new_edf
+                st.session_state.edit_log_df      = new_log
+                st.session_state.confirm_excl_tab0 = False
+                st.session_state.pending_excl_tab0 = []
+                st.toast(f'🗑️ 已排除 {len(pending_t0)} 筆', icon='🗑️')
+                st.rerun()
+            if cc2.button('❌ 取消', key='t0_excl_no', use_container_width=True):
+                st.session_state.confirm_excl_tab0 = False
+                st.session_state.pending_excl_tab0 = []
+                st.rerun()
+        else:
+            btn_col, info_col = st.columns([2, 5])
+            with btn_col:
+                if st.button(
+                    f'🗑️ 排除勾選（{len(to_excl_t0)} 筆）',
+                    disabled=not to_excl_t0,
+                    key='t0_excl_btn',
+                    use_container_width=True,
+                ):
+                    st.session_state.confirm_excl_tab0 = True
+                    st.session_state.pending_excl_tab0 = to_excl_t0
+                    st.rerun()
+            with info_col:
+                if to_excl_t0:
+                    st.info(f'已勾選 {len(to_excl_t0)} 筆，點擊按鈕後確認排除。')
 
     # ── Tab 1：原始解析點位表 ───────────────────────
     with tabs[1]:
@@ -766,55 +882,113 @@ def main():
     with tabs[5]:
         st.subheader('分類表')
         st.caption(
-            '依類別碼最後兩碼（細類碼）自動判斷設施類型，'
-            '套用表 6-9 ～ 表 6-17 屬性欄位格式。'
-            '空白欄位為來源 CSV 未包含之屬性，需人工補填。'
+            '依類別碼最後兩碼自動判斷設施類型（表 6-9 ～ 表 6-17）。'
+            '空白欄位需人工補填。已排除資料預設不顯示（可在側邊欄開啟）。'
         )
+        show_excl_cls = st.session_state.get('show_excluded', False)
         edf_cls = st.session_state.edited_points_df.copy()
 
-        # 計算各設施類型點位數
+        # 統計各設施類型（含/不含排除依切換開關）
         def _safe_ftype(c):
             s = str(c).strip() if (c is not None and not (isinstance(c, float) and math.isnan(c))) else ''
             return get_facility_type(s)
 
-        edf_cls['__ftype__'] = edf_cls['edited_category'].apply(_safe_ftype)
-        ftype_counts = edf_cls['__ftype__'].value_counts()
+        edf_cls_stat = edf_cls if show_excl_cls else edf_cls[~edf_cls.apply(_is_excl, axis=1)]
+        edf_cls_stat['__ftype__'] = edf_cls_stat['edited_category'].apply(_safe_ftype)
+        ftype_counts = edf_cls_stat['__ftype__'].value_counts()
 
-        # 統計列
-        st.markdown('**各設施類型點位數量：**')
+        st.markdown('**各設施類型點位數量（已排除不計）：**')
         stat_cols = st.columns(len(FACILITY_TYPES))
         for i, ft in enumerate(FACILITY_TYPES):
             stat_cols[i].metric(ft, int(ftype_counts.get(ft, 0)))
 
         st.divider()
 
-        # 設施分類選擇器
-        _TABLE_LABELS = [
-            f'表 6-{9+i}　{ft}' for i, ft in enumerate(FACILITY_TYPES)
-        ]
         sel_idx = st.radio(
             '選擇設施分類',
             range(len(FACILITY_TYPES)),
-            format_func=lambda i: _TABLE_LABELS[i],
+            format_func=lambda i: FACILITY_TYPES[i],
             horizontal=True,
             key='cls_sel_type',
         )
         sel_type = FACILITY_TYPES[sel_idx]
 
-        # 建立並顯示分類表
-        cls_df = build_classification_df(edf_cls, sel_type)
-        n_rows = len(cls_df)
+        # 建立分類表（include_excluded 由 show_excluded 決定）
+        cls_df    = build_classification_df(edf_cls, sel_type, include_excluded=show_excl_cls)
+        cls_pkeys = build_cls_pkey_list(edf_cls, sel_type, include_excluded=show_excl_cls)
+        n_rows    = len(cls_df)
 
         if n_rows == 0:
-            st.info(f'目前資料中沒有「{sel_type}」類型的點位（細類碼對應 表 6-{9+sel_idx}）。')
+            st.info(f'目前資料中沒有「{sel_type}」類型的點位。')
         else:
             unit = '條' if sel_type == '管線' else '個'
             st.caption(
-                f'表 6-{9+sel_idx}　{sel_type}｜'
-                f'共 {n_rows} {unit}｜'
-                f'欄位數：{len(cls_df.columns)}'
+                f'{sel_type}｜共 {n_rows} {unit}｜'
+                f'欄位數：{len(cls_df.columns)}　｜　'
+                '勾選「🗑️」後點擊排除按鈕'
             )
-            st.dataframe(cls_df, use_container_width=True, hide_index=True)
+
+            cls_ed = cls_df.copy().reset_index(drop=True)
+            cls_ed.insert(0, '刪除', False)
+
+            edited_cls = st.data_editor(
+                cls_ed,
+                column_config={'刪除': st.column_config.CheckboxColumn(
+                    '🗑️', default=False, help='勾選後點擊「排除勾選」')},
+                disabled=[c for c in cls_ed.columns if c != '刪除'],
+                hide_index=True,
+                use_container_width=True,
+                key=f'cls_editor_{sel_type}',
+            )
+
+            checked_cls = [i for i, v in enumerate(edited_cls['刪除'].tolist()) if v]
+
+            # 對管線（list of lists）與點位（list of str）統一展平
+            to_excl_cls = []
+            for i in checked_cls:
+                if i >= len(cls_pkeys):
+                    continue
+                entry = cls_pkeys[i]
+                if isinstance(entry, list):
+                    to_excl_cls.extend(entry)
+                else:
+                    to_excl_cls.append(entry)
+
+            # 確認對話框
+            if st.session_state.get('confirm_excl_cls') and st.session_state.get('pending_excl_cls'):
+                pending_cls = st.session_state['pending_excl_cls']
+                st.warning(f'⚠️ 確定排除 **{len(pending_cls)}** 個點位？')
+                cc1, cc2 = st.columns(2)
+                if cc1.button('✅ 確認排除', key='cls_excl_yes', type='primary',
+                              use_container_width=True):
+                    new_edf, new_log = exclude_points(
+                        st.session_state.edited_points_df,
+                        st.session_state.edit_log_df, pending_cls)
+                    st.session_state.edited_points_df = new_edf
+                    st.session_state.edit_log_df      = new_log
+                    st.session_state.confirm_excl_cls  = False
+                    st.session_state.pending_excl_cls  = []
+                    st.toast(f'🗑️ 已排除 {len(pending_cls)} 個點位', icon='🗑️')
+                    st.rerun()
+                if cc2.button('❌ 取消', key='cls_excl_no', use_container_width=True):
+                    st.session_state.confirm_excl_cls = False
+                    st.session_state.pending_excl_cls = []
+                    st.rerun()
+            else:
+                btn_c, info_c = st.columns([2, 5])
+                with btn_c:
+                    if st.button(
+                        f'🗑️ 排除勾選（{len(to_excl_cls)} 點）',
+                        disabled=not to_excl_cls,
+                        key='cls_excl_btn',
+                        use_container_width=True,
+                    ):
+                        st.session_state.confirm_excl_cls = True
+                        st.session_state.pending_excl_cls = to_excl_cls
+                        st.rerun()
+                with info_c:
+                    if to_excl_cls:
+                        st.info(f'管線排除將影響該管線的所有 {len(to_excl_cls)} 個點位。')
 
         st.caption('d = 埋設深度（公尺）。管線表每條管線佔一列，點位座標以「第N點X/Y/Z/d」橫向展開。')
 
@@ -823,7 +997,7 @@ def main():
         st.subheader('下載成果檔案')
 
         # v3 整合 Excel
-        st.markdown('#### 📊 v3 整合成果 Excel（15 工作表）')
+        st.markdown('#### 📊 v3 整合成果 Excel（16 工作表）')
         v3_bytes = export_v3_bytes(
             original_df,
             st.session_state.edited_points_df,
@@ -838,13 +1012,43 @@ def main():
             file_name='GML處理成果_v3.xlsx',
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         )
+        n_excl_dl = int(st.session_state.edited_points_df.apply(_is_excl, axis=1).sum())
         st.caption(
-            '工作表（6 基礎）：原始解析點位表 / 修正後點位表 / 人工判讀紀錄表 '
-            '/ 修正紀錄表 / 異常清單 / 重複量測比對表　'
-            '＋（9 分類表）分類表_管線 / 分類表_人手孔 / 分類表_開關閥 / '
-            '分類表_消防栓 / 分類表_電桿 / 分類表_號誌 / '
-            '分類表_其他設施 / 分類表_維護口 / 分類表_場站'
+            f'修正後點位表 / 人工判讀紀錄表 / 分類表：僅含納入成果的點位。'
+            f'已排除 {n_excl_dl} 筆資料另存於「已排除資料」工作表。　'
+            '工作表（16）：原始解析 / 修正後成果 / 人工判讀 / 修正紀錄 / 異常清單 / 重複量測 '
+            '/ 分類表×9 / 已排除資料'
         )
+
+        st.divider()
+
+        # ── 分類表個別下載 ─────────────────────────────
+        st.markdown('#### 📂 分類表個別下載')
+        st.caption('每個按鈕輸出單一設施類型；欄位依公共設施屬性項目表規則排列，預設不含已排除資料。')
+        _cls_dl_edf = st.session_state.edited_points_df
+        _MIME_XLSX   = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        # 全部
+        st.download_button(
+            '📥 下載全部分類 Excel',
+            data=export_classification_bytes(_cls_dl_edf, '全部設施'),
+            file_name='分類表_全部設施.xlsx',
+            mime=_MIME_XLSX,
+            use_container_width=True,
+        )
+        # 9 種個別類型：每列 3 個按鈕
+        _cls_rows = [FACILITY_TYPES[i:i+3] for i in range(0, len(FACILITY_TYPES), 3)]
+        for _row_types in _cls_rows:
+            _btn_cols = st.columns(3)
+            for _col, _ft in zip(_btn_cols, _row_types):
+                with _col:
+                    st.download_button(
+                        f'📥 下載{_ft} Excel',
+                        data=export_classification_bytes(_cls_dl_edf, _ft),
+                        file_name=f'分類表_{_ft}.xlsx',
+                        mime=_MIME_XLSX,
+                        use_container_width=True,
+                        key=f'dl_cls_{_ft}',
+                    )
 
         st.divider()
 
@@ -882,6 +1086,7 @@ def main():
                 anomaly_set=anomaly_set,
                 selected_key=None,
                 canvas_height=800,
+                show_excluded=False,
             )
             html_str = pio.to_html(
                 fig_dl, include_plotlyjs=True, full_html=True,

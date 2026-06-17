@@ -24,6 +24,37 @@ DEFAULT_COLUMN_ALIASES = {
 
 STD_FIELDS = list(DEFAULT_COLUMN_ALIASES.keys())
 
+# 判斷完全空白列的欄位清單（全空 → 排除，不進入任何成果表）
+_BLANK_CHECK_FIELDS = ['raw_id', 'raw_category', 'raw_x', 'raw_y', 'raw_z']
+
+
+def _is_empty_val(v):
+    """判斷一個值是否為空（None、NaN、空字串）。"""
+    if v is None:
+        return True
+    try:
+        import math
+        if isinstance(v, float) and math.isnan(v):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip() == ''
+
+
+def filter_blank_rows(df):
+    """
+    排除無任何有效點位資訊的空白列。
+    判斷條件：raw_id、raw_category、raw_x、raw_y、raw_z 全部為空（None/NaN/空字串）。
+    回傳 (filtered_df, n_removed)。
+    """
+    if df.empty:
+        return df, 0
+    def _is_blank(row):
+        return all(_is_empty_val(row.get(f)) for f in _BLANK_CHECK_FIELDS)
+    mask = df.apply(_is_blank, axis=1)
+    n_removed = int(mask.sum())
+    return df[~mask].reset_index(drop=True), n_removed
+
 
 def load_config(config_path):
     if os.path.exists(config_path):
@@ -174,7 +205,9 @@ def load_all_csvs(input_dir, config_path):
                     rec[f'raw_{std_name}'] = None
             records.append(rec)
 
-        df_std = pd.DataFrame(records)
+        df_std, n_blank = filter_blank_rows(pd.DataFrame(records))
+        if n_blank:
+            print(f'  [清理] 排除 {n_blank} 筆空白列')
         all_records.append(df_std)
 
     if not all_records:
@@ -230,7 +263,11 @@ def _parse_uploaded_file(uploaded_file, aliases):
                 rec[f'raw_{std_name}'] = None
         records.append(rec)
 
-    return pd.DataFrame(records), meta, None
+    raw_df = pd.DataFrame(records)
+    cleaned_df, n_blank = filter_blank_rows(raw_df)
+    if n_blank:
+        meta['blank_rows_removed'] = n_blank
+    return cleaned_df, meta, None
 
 
 def load_uploaded_csvs(uploaded_files, config_path):

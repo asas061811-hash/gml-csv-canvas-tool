@@ -29,7 +29,7 @@ COLOR_PALETTE = [
 
 # ── 選項清單（供 app.py import）────────────────────────
 REVIEW_STATUS_OPTIONS  = ['未判讀', '正常', '待確認', '需廠商補測', '排除', '採用', '已修正']
-PROBLEM_TYPE_OPTIONS   = ['無', '點位偏移', '點位缺漏', '點位重複', '座標異常', '日期不一致', '點序錯誤', '其他']
+PROBLEM_TYPE_OPTIONS   = ['無', '點位偏移', '點位缺漏', '點位重複', '座標異常', '日期不一致', '點序錯誤', '手動排除', '其他']
 INCLUDE_RESULT_OPTIONS = ['是', '否']
 
 # ── 管線分類對照表（公共設施管線資料庫）──────────────
@@ -369,17 +369,22 @@ def _build_pipeline_classification(fdf):
     return df[all_cols].fillna('')
 
 
-def build_classification_df(edited_df, facility_type):
+def build_classification_df(edited_df, facility_type, include_excluded=False):
     """
     依設施類型（表 6-9 ～ 表 6-17）建立分類表 DataFrame。
     - 管線：一條管線一列，點位座標橫向展開（第N點X/Y/Z/d）。
     - 其他：一個點位一列，固定欄位，缺少的來源欄位留空。
+    - include_excluded=False（預設）：已排除點位不出現在分類表。
     """
     if facility_type not in FACILITY_TYPES:
         return pd.DataFrame()
     if 'edited_category' not in edited_df.columns:
         schema = FACILITY_SCHEMAS.get(facility_type)
         return pd.DataFrame(columns=schema or _PIPELINE_BASE_COLS + _PIPELINE_TAIL_COLS)
+
+    # 過濾已排除點位（預設行為：排除不納入成果的點位）
+    if not include_excluded:
+        edited_df = edited_df[~edited_df.apply(_is_excluded, axis=1)].copy()
 
     fdf = _facility_filter(edited_df, facility_type)
 
@@ -391,6 +396,34 @@ def build_classification_df(edited_df, facility_type):
         return pd.DataFrame(columns=schema)
     rows = [_row_to_cls_dict(r, schema) for _, r in fdf.iterrows()]
     return pd.DataFrame(rows, columns=schema)
+
+
+def build_cls_pkey_list(edited_df, facility_type, include_excluded=False):
+    """
+    回傳與 build_classification_df 同順序的 point_key 清單。
+    - 點位型：每個元素為一個 point_key 字串。
+    - 管線型：每個元素為該管線包含的 point_key 字串 list。
+    用於分類表勾選排除時，能正確對應到 edited_points_df 的點位。
+    """
+    if 'edited_category' not in edited_df.columns or 'point_key' not in edited_df.columns:
+        return []
+    if not include_excluded:
+        edited_df = edited_df[~edited_df.apply(_is_excluded, axis=1)].copy()
+    fdf = _facility_filter(edited_df, facility_type)
+    if fdf.empty:
+        return []
+    if facility_type != '管線':
+        return [_vstr(r.get('point_key')) for _, r in fdf.iterrows()]
+    # 管線：依相同群組邏輯
+    grouped = {}
+    for _, row in fdf.iterrows():
+        pid = _vstr(row.get('edited_pipeline_id'))
+        key = pid if pid else f'__nopid__{row["point_key"]}'
+        grouped.setdefault(key, []).append(row)
+    result = []
+    for pts in grouped.values():
+        result.append([_vstr(pt.get('point_key')) for pt in pts])
+    return result
 
 
 def _row_snapshot(row_dict, fields):
@@ -654,6 +687,75 @@ def restore_point(edited_df, edit_log_df, point_key, original_df):
     return edited_df, edit_log_df
 
 
+def exclude_points(edited_df, edit_log_df, point_keys, note='手動排除'):
+    """
+    批次標記多個點位為「排除，不納入成果」。
+    不刪除原始資料，只更新狀態，並寫入修正紀錄。
+    """
+    edited_df = edited_df.copy()
+    for pkey in point_keys:
+        idxs = edited_df.index[edited_df['point_key'] == pkey].tolist()
+        if not idxs:
+            continue
+        i = idxs[0]
+        prev = edited_df.loc[i].to_dict()
+        before_snap = _row_snapshot(prev, _SNAP_FIELDS)
+
+        edited_df.loc[i, 'review_status']     = '排除'
+        edited_df.loc[i, 'include_in_result'] = '否'
+        edited_df.loc[i, 'problem_type']      = '手動排除'
+        old_note = str(edited_df.loc[i, 'manual_note'] or '')
+        if note and note not in old_note:
+            edited_df.loc[i, 'manual_note'] = (old_note + '；' + note).lstrip('；')
+        edited_df.loc[i, 'is_modified'] = True
+
+        after_snap = _row_snapshot(edited_df.loc[i].to_dict(), _SNAP_FIELDS)
+        orig_info  = {
+            '_source_file':  prev.get('_source_file'),
+            '_original_row': prev.get('_original_row'),
+            'raw_id':        prev.get('raw_id'),
+        }
+        edit_log_df = _save_log(
+            edit_log_df, pkey, '手動排除', orig_info,
+            before_snap, after_snap,
+            '排除', '手動排除',
+            str(edited_df.loc[i, 'manual_note']), '否',
+        )
+    return edited_df, edit_log_df
+
+
+def restore_excluded(edited_df, edit_log_df, point_keys):
+    """
+    將指定的已排除點位還原為「未判讀，納入成果」。
+    """
+    edited_df = edited_df.copy()
+    for pkey in point_keys:
+        idxs = edited_df.index[edited_df['point_key'] == pkey].tolist()
+        if not idxs:
+            continue
+        i = idxs[0]
+        prev = edited_df.loc[i].to_dict()
+        before_snap = _row_snapshot(prev, _SNAP_FIELDS)
+
+        edited_df.loc[i, 'review_status']     = '未判讀'
+        edited_df.loc[i, 'include_in_result'] = '是'
+        edited_df.loc[i, 'problem_type']      = '無'
+        edited_df.loc[i, 'is_modified']       = True
+
+        after_snap = _row_snapshot(edited_df.loc[i].to_dict(), _SNAP_FIELDS)
+        orig_info  = {
+            '_source_file':  prev.get('_source_file'),
+            '_original_row': prev.get('_original_row'),
+            'raw_id':        prev.get('raw_id'),
+        }
+        edit_log_df = _save_log(
+            edit_log_df, pkey, '還原排除', orig_info,
+            before_snap, after_snap,
+            '未判讀', '無', str(edited_df.loc[i, 'manual_note']), '是',
+        )
+    return edited_df, edit_log_df
+
+
 def clear_all_edits(edited_df, original_df, edit_log_df):
     """還原所有人工修正至原始值，並寫入一筆清除紀錄。"""
     edited_df = edited_df.copy()
@@ -751,13 +853,17 @@ def _hover_v3(row):
 
 
 def build_figure_v3(edited_df, anomaly_set=None, selected_key=None,
-                    canvas_height=580, uirevision='keep_zoom'):
+                    canvas_height=580, uirevision='keep_zoom',
+                    show_excluded=True):
     """
     以 edited_points_df 產生 v3 畫布。
+    show_excluded=False 時，已排除點位（include_in_result=否 或 review_status=排除）不顯示於畫布。
     customdata 存 point_key，供 Streamlit plotly selection 使用。
     """
     if anomaly_set is None:
         anomaly_set = set()
+    if not show_excluded:
+        edited_df = edited_df[~edited_df.apply(_is_excluded, axis=1)].copy()
 
     df_plot = edited_df[
         edited_df['edited_x_val'].notna() & edited_df['edited_y_val'].notna()
@@ -1042,13 +1148,49 @@ def _write_sheet(ws, headers, rows, fill_key='blue'):
 _CLS_SHEET_FILLS = ['blue', 'green', 'teal', 'orange', 'red', 'purple', 'teal', 'green', 'blue']
 
 
+def export_classification_bytes(edited_df, facility_type='全部設施'):
+    """
+    匯出分類表 Excel BytesIO。
+    facility_type='全部設施' → 輸出 9 張工作表（每種設施一張）。
+    其他 facility_type → 輸出單一設施類型（一張工作表）。
+    預設只含納入成果的點位（已排除不輸出）。
+    """
+    wb = openpyxl.Workbook()
+    if facility_type == '全部設施':
+        for idx, ft in enumerate(FACILITY_TYPES):
+            ws = wb.active if idx == 0 else wb.create_sheet()
+            ws.title = f'分類表_{ft}'
+            cls_df = build_classification_df(edited_df, ft, include_excluded=False)
+            _write_sheet(ws, list(cls_df.columns), cls_df.to_dict('records'),
+                         _CLS_SHEET_FILLS[idx])
+    else:
+        idx = FACILITY_TYPES.index(facility_type) if facility_type in FACILITY_TYPES else 0
+        ws = wb.active
+        ws.title = f'分類表_{facility_type}'
+        cls_df = build_classification_df(edited_df, facility_type, include_excluded=False)
+        _write_sheet(ws, list(cls_df.columns), cls_df.to_dict('records'),
+                     _CLS_SHEET_FILLS[idx])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
 def export_v3_bytes(original_df, edited_df, edit_log_df, anomaly_list, dup_list):
     """
-    產生 v3 多工作表 Excel BytesIO（6 基礎工作表 + 9 分類表工作表，共 15 張）。
+    產生 v3 多工作表 Excel BytesIO（16 張工作表）：
+      - 6 基礎表（原始解析 / 修正後成果 / 人工判讀 / 修正紀錄 / 異常清單 / 重複量測）
+      - 9 分類表（管線 ～ 場站）
+      - 1 已排除資料表
+    修正後成果 / 人工判讀 / 分類表：預設只含 include_in_result='是' 的點位。
     """
     wb = openpyxl.Workbook()
 
-    # ── 1. 原始解析點位表 ─────────────────────────────
+    # 區分納入成果 vs 已排除
+    included_df = edited_df[~edited_df.apply(_is_excluded, axis=1)]
+    excluded_df = edited_df[edited_df.apply(_is_excluded, axis=1)]
+
+    # ── 1. 原始解析點位表（永遠保留全部）─────────────
     ws1 = wb.active
     ws1.title = '原始解析點位表'
     orig_h = ['來源CSV', '原始列號', '原始識別碼', '管線識別碼', '點號', '類別碼',
@@ -1061,7 +1203,7 @@ def export_v3_bytes(original_df, edited_df, edit_log_df, anomaly_list, dup_list)
     }
     _write_sheet(ws1, orig_h, [{h: r.get(orig_m[h]) for h in orig_h} for _, r in original_df.iterrows()], 'blue')
 
-    # ── 2. 修正後點位表 ─────────────────────────────
+    # ── 2. 修正後點位表（僅含納入成果的點位）──────────
     ws2 = wb.create_sheet('修正後點位表')
     edit_h = [
         '來源CSV', '原始列號', '原始識別碼', '類別碼',
@@ -1078,15 +1220,15 @@ def export_v3_bytes(original_df, edited_df, edit_log_df, anomaly_list, dup_list)
         '是否已修正': 'is_modified',
     }
     edit_rows = []
-    for _, row in edited_df.iterrows():
+    for _, row in included_df.iterrows():
         d = {h: row.get(edit_m[h]) for h in edit_h}
         d['是否已修正'] = '是' if d.get('是否已修正') else '否'
         d['__is_modified__'] = bool(row.get('is_modified', False))
-        d['__is_excluded__'] = _is_excluded(row.to_dict())
+        d['__is_excluded__'] = False
         edit_rows.append(d)
     _write_sheet(ws2, edit_h, edit_rows, 'green')
 
-    # ── 3. 人工判讀紀錄表 ────────────────────────────
+    # ── 3. 人工判讀紀錄表（僅含納入成果的點位）──────
     ws3 = wb.create_sheet('人工判讀紀錄表')
     rev_h = [
         '來源CSV', '原始列號', '原始識別碼', '管線識別碼', '點號',
@@ -1102,7 +1244,7 @@ def export_v3_bytes(original_df, edited_df, edit_log_df, anomaly_list, dup_list)
         '判讀狀態': 'review_status', '問題類型': 'problem_type',
         '人工備註': 'manual_note', '是否納入成果': 'include_in_result',
     }
-    _write_sheet(ws3, rev_h, [{h: r.get(rev_m[h]) for h in rev_h} for _, r in edited_df.iterrows()], 'teal')
+    _write_sheet(ws3, rev_h, [{h: r.get(rev_m[h]) for h in rev_h} for _, r in included_df.iterrows()], 'teal')
 
     # ── 4. 修正紀錄表 ────────────────────────────────
     ws4 = wb.create_sheet('修正紀錄表')
@@ -1128,12 +1270,31 @@ def export_v3_bytes(original_df, edited_df, edit_log_df, anomaly_list, dup_list)
     ]
     _write_sheet(ws6, dup_h, dup_list, 'purple')
 
-    # ── 7-15. 分類表（表 6-9 ～ 表 6-17）──────────────
+    # ── 7-15. 分類表（表 6-9 ～ 表 6-17，僅含納入成果的點位）──
     for idx, ft in enumerate(FACILITY_TYPES):
         ws_cls = wb.create_sheet(f'分類表_{ft}')
-        cls_df = build_classification_df(edited_df, ft)
+        cls_df = build_classification_df(edited_df, ft, include_excluded=False)
         _write_sheet(ws_cls, list(cls_df.columns), cls_df.to_dict('records'),
                      _CLS_SHEET_FILLS[idx])
+
+    # ── 16. 已排除資料 ────────────────────────────────
+    ws_excl = wb.create_sheet('已排除資料')
+    excl_h = [
+        'point_key', '來源CSV', '原始列號', '原始識別碼',
+        '類別碼', '管線識別碼', '點號', 'X', 'Y', 'Z',
+        '判讀狀態', '問題類型', '人工備註', '是否納入成果',
+    ]
+    excl_m = {
+        'point_key': 'point_key',
+        '來源CSV': '_source_file', '原始列號': '_original_row',
+        '原始識別碼': 'edited_raw_id', '類別碼': 'edited_category',
+        '管線識別碼': 'edited_pipeline_id', '點號': 'edited_point_no',
+        'X': 'edited_x', 'Y': 'edited_y', 'Z': 'edited_z',
+        '判讀狀態': 'review_status', '問題類型': 'problem_type',
+        '人工備註': 'manual_note', '是否納入成果': 'include_in_result',
+    }
+    excl_rows = [{h: r.get(excl_m[h]) for h in excl_h} for _, r in excluded_df.iterrows()]
+    _write_sheet(ws_excl, excl_h, excl_rows, 'red')
 
     buf = io.BytesIO()
     wb.save(buf)
