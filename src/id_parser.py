@@ -1,58 +1,74 @@
-# -*- coding: utf-8 -*-
 """
-id_parser.py
-------------
-解析「原始識別碼」，拆出「管線識別碼」與「點號」。
+id_parser.py - 解析識別碼，拆解出管線識別碼與點號。
 
-規則：抓取識別碼結尾的連續數字作為點號，其餘部分為管線識別碼。
-
-範例：
-    1-9-30mTE04~TB06-C1  ->  管線識別碼: 1-9-30mTE04~TB06-C   點號: 1
-    1-9-30mTE04~TB06-C6  ->  管線識別碼: 1-9-30mTE04~TB06-C   點號: 6
-
-若識別碼結尾沒有數字，則：
-    管線識別碼 = 原始識別碼（整串）
-    點號 = None
+規則：識別碼末尾的連續數字為「點號」，其餘為「管線識別碼」。
+例：
+  1-9-30mTE04~TB06-C1  → 管線識別碼: 1-9-30mTE04~TB06-C  點號: 1
+  1-9-30mTE04~TB06-C6  → 管線識別碼: 1-9-30mTE04~TB06-C  點號: 6
+  1-9-30mTE04~TB06-C12 → 管線識別碼: 1-9-30mTE04~TB06-C  點號: 12
 """
 
 import re
+import pandas as pd
 
 
-def parse_id(raw_id, pattern=r"^(.*?)(\d+)$"):
+def parse_id(raw_id):
     """
-    解析單一識別碼字串。
-
-    回傳:
-        (管線識別碼, 點號)
-        點號為 int，若無法解析則為 None。
+    回傳 (pipeline_id, point_no_str)。
+    無法解析時回傳 (raw_id, None)。
     """
     if raw_id is None:
-        return "", None
+        return None, None
 
-    raw_id = str(raw_id).strip()
-    if raw_id == "":
-        return "", None
+    s = str(raw_id).strip()
+    if not s:
+        return None, None
 
-    m = re.match(pattern, raw_id)
+    # 末尾為數字序列：分割為前綴（管線識別碼）+ 數字（點號）
+    m = re.match(r'^(.*\D)(\d+)$', s)
     if m:
-        pipeline_id = m.group(1)
-        point_no = int(m.group(2))
-        return pipeline_id, point_no
-    else:
-        # 結尾沒有數字，整串視為管線識別碼，點號留空
-        return raw_id, None
+        return m.group(1), m.group(2)
+
+    # 整個識別碼全為數字（特殊情形：無法區分管線與點號）
+    if re.match(r'^\d+$', s):
+        return s, s
+
+    # 末尾無數字（無法拆出點號）
+    return s, None
 
 
-def parse_records(records, rules):
+def try_int(s):
+    """嘗試將字串轉為整數，失敗時回傳 None。"""
+    if s is None:
+        return None
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_all_ids(df):
     """
-    為每筆 record 加入「管線識別碼」與「點號」欄位。
-    直接修改傳入的 records（list[dict]），並回傳同一份 list。
+    在 df 中新增欄位：
+      pipeline_id  - 管線識別碼
+      point_no     - 點號（字串）
+      point_no_int - 點號（整數，用於排序；無法轉換時為 None）
+    回傳新的 DataFrame（不修改原始 df）。
     """
-    pattern = rules.get("id_parse", {}).get("trailing_digit_regex", r"^(.*?)(\d+)$")
+    df = df.copy()
 
-    for rec in records:
-        pipeline_id, point_no = parse_id(rec.get("原始識別碼", ""), pattern)
-        rec["管線識別碼"] = pipeline_id
-        rec["點號"] = point_no
+    pipeline_ids = []
+    point_nos = []
+    point_no_ints = []
 
-    return records
+    for raw_id in df['raw_id']:
+        pid, pno = parse_id(raw_id)
+        pipeline_ids.append(pid)
+        point_nos.append(pno)
+        point_no_ints.append(try_int(pno))
+
+    df['pipeline_id'] = pipeline_ids
+    df['point_no'] = point_nos
+    df['point_no_int'] = pd.array(point_no_ints, dtype=pd.Int64Dtype())
+
+    return df

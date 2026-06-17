@@ -1,125 +1,107 @@
-# -*- coding: utf-8 -*-
 """
-main.py
--------
-GML CSV 點位畫布工具 - 主程式
+main.py - GML CSV 點位處理工具主程式
 
-執行方式（於專案根目錄）：
-    python src/main.py
-
-會依序：
-    1. 讀取 config/rules.yaml
-    2. 讀取 input_csv 內所有 CSV（不修改原始檔案）
-    3. 解析識別碼，拆出管線識別碼與點號
-    4. 進行各項異常檢查與重複點位比對
-    5. 輸出：
-        output/點位畫布.html
-        output/解析後點位表.xlsx
-        output/異常清單.xlsx
-        output/重複量測比對表.xlsx
+用法：
+  python src/main.py
+  （請在 gml-csv-canvas-tool/ 目錄下執行，或使用 run.bat）
 """
 
 import os
 import sys
 
-import yaml
-
-# 確保可以匯入同目錄下的模組
+# 確保 src/ 可 import 同層模組
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import csv_loader
-import id_parser
-import anomaly_detector
-import canvas_generator
-import excel_exporter
+from csv_loader import load_all_csvs
+from id_parser import parse_all_ids
+from anomaly_detector import detect_anomalies
+from canvas_generator import generate_canvas
+from excel_exporter import export_all
 
-
-def get_project_root():
-    # src/ 的上一層即為專案根目錄
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ---- 路徑設定 ----
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+INPUT_DIR  = os.path.join(BASE_DIR, 'input_csv')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
+CONFIG_PATH = os.path.join(BASE_DIR, 'config', 'rules.yaml')
 
 
 def main():
-    root = get_project_root()
-    input_dir = os.path.join(root, "input_csv")
-    output_dir = os.path.join(root, "output")
-    rules_path = os.path.join(root, "config", "rules.yaml")
+    print('=' * 55)
+    print('  GML CSV 點位處理工具  v2.0')
+    print('=' * 55)
+    print()
 
-    os.makedirs(input_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
+    # 建立輸出目錄
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print("=" * 60)
-    print("GML CSV 點位畫布工具")
-    print("=" * 60)
+    # ── 步驟 1：讀取 CSV ──────────────────────────────────────
+    print('【步驟 1】讀取 CSV 檔案')
+    print(f'  輸入目錄: {INPUT_DIR}')
 
-    # 1. 讀取設定檔
-    if not os.path.exists(rules_path):
-        print(f"[錯誤] 找不到設定檔: {rules_path}")
+    df, file_meta, load_errors = load_all_csvs(INPUT_DIR, CONFIG_PATH)
+
+    if load_errors:
+        print(f'\n  [警告] {len(load_errors)} 個檔案讀取失敗：')
+        for err in load_errors:
+            print(f'    - {err["file"]}：{err["error"]}')
+
+    if df.empty:
+        print('\n[錯誤] 未讀取到任何資料。')
+        print('  請確認 input_csv/ 資料夾內有 CSV 檔案。')
         sys.exit(1)
 
-    with open(rules_path, "r", encoding="utf-8") as f:
-        rules = yaml.safe_load(f)
+    print(f'\n  共載入 {len(df)} 筆資料，來自 {len(file_meta)} 個檔案。\n')
 
-    # 2. 讀取所有 CSV
-    print(f"\n[1/5] 讀取 CSV 檔案：{input_dir}")
-    records, warnings = csv_loader.load_all_csv(input_dir, rules)
+    # ── 步驟 2：解析識別碼 ───────────────────────────────────
+    print('【步驟 2】解析識別碼')
+    df = parse_all_ids(df)
 
-    if warnings:
-        print("  -- 讀取警告 --")
-        for w in warnings:
-            print(f"  * {w}")
+    pipeline_count = df['pipeline_id'].nunique()
+    print(f'  共識別出 {pipeline_count} 條管線識別碼。\n')
 
-    if not records:
-        print("\n[結束] 沒有讀取到任何資料列，請確認 input_csv 內是否放置了 CSV 檔案。")
-        return
+    # ── 步驟 3：異常偵測 ────────────────────────────────────
+    print('【步驟 3】異常偵測')
+    df, anomaly_list, duplicate_list = detect_anomalies(df, CONFIG_PATH, file_meta)
 
-    print(f"  共讀取 {len(records)} 筆資料列。")
+    # 建立異常點集合（用於畫布標示）
+    anomaly_rows = set()
+    for item in anomaly_list:
+        src = item.get('來源CSV')
+        row_no = item.get('原始列號')
+        if src and row_no and row_no != '（整份檔案）':
+            try:
+                anomaly_rows.add((src, int(row_no)))
+            except (ValueError, TypeError):
+                pass
 
-    # 3. 解析識別碼
-    print("\n[2/5] 解析識別碼（管線識別碼 / 點號）")
-    records = id_parser.parse_records(records, rules)
+    print(f'  偵測到 {len(anomaly_list)} 筆異常。')
+    print(f'  偵測到 {len(duplicate_list)} 筆重複量測記錄。\n')
 
-    # 4. 異常檢查與重複點位比對
-    print("\n[3/5] 進行異常檢查與重複點位比對")
-    records, anomalies, duplicates = anomaly_detector.process_records(records, rules)
-    print(f"  發現異常項目：{len(anomalies)} 筆")
-    print(f"  重複量測比對項目：{len(duplicates)} 筆")
+    # ── 步驟 4：產生點位畫布 ─────────────────────────────────
+    print('【步驟 4】產生互動式 HTML 點位畫布')
+    canvas_path = os.path.join(OUTPUT_DIR, '點位畫布.html')
+    generate_canvas(df, canvas_path, anomaly_rows=anomaly_rows)
 
-    # 5. 輸出 HTML 畫布
-    print("\n[4/5] 產生互動式 HTML 畫布")
-    canvas_path = os.path.join(output_dir, "點位畫布.html")
-    canvas_generator.generate_canvas(records, canvas_path)
-    print(f"  已輸出: {canvas_path}")
+    # ── 步驟 5：輸出 Excel ───────────────────────────────────
+    print('\n【步驟 5】輸出 Excel 成果檔案')
+    export_all(df, anomaly_list, duplicate_list, OUTPUT_DIR)
 
-    # 6. 輸出 Excel（第一版）
-    print("\n[5/5] 輸出 Excel 報表（第一版）")
-    parsed_path = os.path.join(output_dir, "解析後點位表.xlsx")
-    anomalies_path = os.path.join(output_dir, "異常清單.xlsx")
-    duplicates_path = os.path.join(output_dir, "重複量測比對表.xlsx")
-
-    excel_exporter.export_parsed_records(records, parsed_path)
-    print(f"  已輸出: {parsed_path}")
-
-    excel_exporter.export_anomalies(anomalies, anomalies_path)
-    print(f"  已輸出: {anomalies_path}")
-
-    excel_exporter.export_duplicates(duplicates, duplicates_path)
-    print(f"  已輸出: {duplicates_path}")
-
-    # 7. 輸出 Excel（第二版：人工判讀與修正範本）
-    print("\n[+] 輸出 Excel 判讀範本（第二版）")
-    review_path = os.path.join(output_dir, "人工判讀紀錄範本.xlsx")
-    correction_path = os.path.join(output_dir, "修正紀錄範本.xlsx")
-
-    excel_exporter.export_review_template(records, review_path)
-    print(f"  已輸出: {review_path}")
-
-    excel_exporter.export_correction_template(correction_path)
-    print(f"  已輸出: {correction_path}")
-
-    print("\n完成！請至 output/ 資料夾查看結果。")
-    print("提醒：所有重複點位、座標差異與異常項目皆需人工確認，本工具不會自動修改或刪除任何資料。")
+    # ── 完成摘要 ────────────────────────────────────────────
+    print()
+    print('=' * 55)
+    print('  完成！成果檔案位於：')
+    print(f'  {OUTPUT_DIR}')
+    print()
+    print('  ├─ 點位畫布.html         ← 用瀏覽器開啟，互動瀏覽點位')
+    print('  ├─ 解析後點位表.xlsx     ← 所有點位的解析結果')
+    print('  ├─ 異常清單.xlsx         ← 需人工確認的異常')
+    print('  ├─ 重複量測比對表.xlsx   ← 重複量測點的座標比對')
+    print('  ├─ 人工判讀紀錄範本.xlsx ← [v2] 逐點填寫判讀狀態（含下拉選單）')
+    print('  └─ 修正紀錄範本.xlsx     ← [v2] 填寫修正決策（含下拉選單）')
+    print()
+    print('  注意：異常標示僅供參考，所有修改決策請由人工確認。')
+    print('=' * 55)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

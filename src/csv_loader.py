@@ -1,221 +1,262 @@
-# -*- coding: utf-8 -*-
 """
-csv_loader.py
---------------
-讀取 input_csv 資料夾內所有 CSV 檔案，並依據 config/rules.yaml 中的
-field_aliases 自動偵測欄位名稱，輸出統一格式的資料列（list of dict）。
+csv_loader.py - 讀取 input_csv 資料夾內所有 CSV，自動偵測編碼與欄位，
+輸出標準化 DataFrame。不修改原始 CSV。
 
-不會修改原始 CSV 檔案，所有讀取皆為唯讀。
+另提供 load_uploaded_csvs() 供 Streamlit 使用。
 """
 
 import io
 import os
 import glob
-
 import pandas as pd
+import yaml
 
-# 標準欄位名稱（程式內部使用）
-STANDARD_FIELDS = ["id", "category", "x", "y", "z", "date"]
+ENCODINGS_TO_TRY = ['utf-8-sig', 'utf-8', 'big5', 'cp950', 'gbk', 'latin-1']
 
+DEFAULT_COLUMN_ALIASES = {
+    'id':       ['識別碼', 'ID', 'id', '點位識別碼', 'point_id', '編號', '點號'],
+    'category': ['類別碼', '類別', '管種', 'category', 'type', 'CAT', 'cat'],
+    'x':        ['X', 'E', 'X(E)', 'X座標', 'Easting', 'x', 'e'],
+    'y':        ['Y', 'N', 'Y(N)', 'Y座標', 'Northing', 'y', 'n'],
+    'z':        ['Z', 'H', 'Z(H)', '高程', 'Height', 'Elevation', 'elevation', 'z', 'h'],
+    'date':     ['日期', '測量日期', '設置日期', '量測日期', 'survey_date', 'date', 'DATE'],
+}
 
-def _normalize_col_name(name):
-    """正規化欄位名稱：去除空白、統一全形括號為半形括號。"""
-    if name is None:
-        return ""
-    name = str(name).strip()
-    name = name.replace("（", "(").replace("）", ")")
-    return name
-
-
-def _build_alias_lookup(field_aliases):
-    """
-    建立 {正規化後的別名: 標準欄位名稱} 的對照表，
-    方便用實際欄位名稱反查標準欄位。
-    """
-    lookup = {}
-    for std_field, aliases in field_aliases.items():
-        for alias in aliases:
-            norm = _normalize_col_name(alias).lower()
-            lookup[norm] = std_field
-    return lookup
+STD_FIELDS = list(DEFAULT_COLUMN_ALIASES.keys())
 
 
-def _detect_column_mapping(header, alias_lookup):
-    """
-    比對 CSV 表頭與別名清單，回傳 {標準欄位名稱: 實際欄位名稱}。
-    若某標準欄位找不到對應的實際欄位，則該標準欄位不會出現在回傳的字典中。
-    """
-    mapping = {}
-    for col in header:
-        norm = _normalize_col_name(col).lower()
-        if norm in alias_lookup:
-            std_field = alias_lookup[norm]
-            # 若已經有對應到的欄位，保留第一個找到的，不覆蓋
-            if std_field not in mapping:
-                mapping[std_field] = col
-    return mapping
-
-
-def _read_csv_with_fallback_encoding(path, encodings):
-    """
-    使用 pandas 嘗試以多種編碼讀取 CSV，回傳 (header, rows, used_encoding)。
-    所有欄位皆以字串（dtype=str）讀入，避免 pandas 自動轉型造成資料失真，
-    rows 為 list[dict]，key 為原始欄位名稱，value 為字串。
-    """
-    last_error = None
-    for enc in encodings:
+def load_config(config_path):
+    if os.path.exists(config_path):
         try:
-            df = pd.read_csv(path, dtype=str, encoding=enc, keep_default_na=False)
-            header = list(df.columns)
-            rows = df.to_dict(orient="records")
-            return header, rows, enc
-        except (UnicodeDecodeError, UnicodeError) as e:
-            last_error = e
-            continue
-    # 全部編碼都失敗，最後再用 errors="replace" 強制讀取，避免整個程式中斷
-    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
-        df = pd.read_csv(f, dtype=str, keep_default_na=False)
-    header = list(df.columns)
-    rows = df.to_dict(orient="records")
-    return header, rows, "utf-8(replace, 編碼可能有誤)"
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f'  [警告] 設定檔讀取失敗：{e}')
+    return {}
 
 
-def load_all_csv(input_dir, rules):
-    """
-    讀取 input_dir 內所有 .csv 檔案。
-
-    回傳:
-        records: list[dict]，每個 dict 為一個資料列，包含以下 key：
-            - 原始識別碼 (str)
-            - 類別碼 (str)
-            - X_raw, Y_raw, Z_raw (str，尚未轉換為數字的原始值)
-            - 測量日期 (str)
-            - 來源CSV (str)
-            - 原始列號 (int，對應 CSV 中的資料行號，標頭為第1行，第一筆資料為第2行)
-            - 缺漏欄位 (list[str]，此列因整個 CSV 缺少對應欄位而標記的標準欄位名稱)
-        file_warnings: list[str]，讀取過程中的警告訊息（例如缺少欄位）
-    """
-    field_aliases = rules.get("field_aliases", {})
-    encodings = rules.get("csv_encodings", ["utf-8-sig", "utf-8", "big5", "cp950", "gb18030"])
-    alias_lookup = _build_alias_lookup(field_aliases)
-
-    records = []
-    file_warnings = []
-
-    csv_paths = sorted(glob.glob(os.path.join(input_dir, "*.csv")))
-    if not csv_paths:
-        file_warnings.append(f"在 {input_dir} 中找不到任何 CSV 檔案。")
-        return records, file_warnings
-
-    for path in csv_paths:
-        filename = os.path.basename(path)
-        header, rows, used_enc = _read_csv_with_fallback_encoding(path, encodings)
-
-        if "編碼可能有誤" in used_enc:
-            file_warnings.append(f"{filename}: 所有預設編碼皆讀取失敗，已以 utf-8 並替換無法解碼字元的方式讀取，內容可能有誤。")
-
-        file_records = _process_file_rows(filename, header, rows, alias_lookup, file_warnings)
-        records.extend(file_records)
-
-    return records, file_warnings
-
-
-# ── Streamlit 網頁版入口 ──────────────────────────────────────────────────────
-
-def _read_bytes_with_fallback_encoding(raw_bytes, encodings):
-    """
-    以多種編碼嘗試解碼 bytes 並讀入 CSV。
-    回傳 (header, rows, used_encoding)，格式同 _read_csv_with_fallback_encoding。
-    """
-    for enc in encodings:
+def detect_encoding(file_path):
+    """嘗試各種編碼，回傳第一個成功讀取的編碼名稱。"""
+    for enc in ENCODINGS_TO_TRY:
         try:
-            df = pd.read_csv(io.BytesIO(raw_bytes), dtype=str, encoding=enc, keep_default_na=False)
-            return list(df.columns), df.to_dict(orient="records"), enc
-        except (UnicodeDecodeError, UnicodeError):
+            with open(file_path, encoding=enc, errors='strict') as f:
+                f.read(8192)
+            return enc
+        except (UnicodeDecodeError, LookupError):
             continue
-    df = pd.read_csv(
-        io.BytesIO(raw_bytes), dtype=str, encoding="utf-8", errors="replace", keep_default_na=False
-    )
-    return list(df.columns), df.to_dict(orient="records"), "utf-8(replace, 編碼可能有誤)"
+    return 'utf-8'
 
 
-def _process_file_rows(filename, header, rows, alias_lookup, file_warnings):
-    """
-    load_all_csv 與 load_from_uploads 共用的內部處理邏輯。
-    回傳該檔案的 records list。
-    """
-    if not header:
-        file_warnings.append(f"{filename}: 無法讀取表頭，已略過此檔案。")
-        return []
-
-    mapping = _detect_column_mapping(header, alias_lookup)
-
-    missing_fields = [f for f in STANDARD_FIELDS if f not in mapping]
-    if missing_fields:
-        file_warnings.append(
-            f"{filename}: 找不到對應欄位 {missing_fields}，"
-            f"請確認該檔案是否有此欄位，或於 config/rules.yaml 中新增別名對應。"
-        )
-
-    records = []
-    for idx, row in enumerate(rows):
-        line_no = idx + 2
-
-        def get_raw(std_field, _mapping=mapping, _row=row):
-            col = _mapping.get(std_field)
-            if col is None:
-                return ""
-            val = _row.get(col, "")
-            return str(val).strip() if val is not None else ""
-
-        records.append({
-            "原始識別碼": get_raw("id"),
-            "類別碼": get_raw("category"),
-            "X_raw": get_raw("x"),
-            "Y_raw": get_raw("y"),
-            "Z_raw": get_raw("z"),
-            "測量日期": get_raw("date"),
-            "來源CSV": filename,
-            "原始列號": line_no,
-            "缺漏欄位": list(missing_fields),
-        })
-
-    return records
-
-
-def load_from_uploads(uploaded_files, rules):
-    """
-    讀取 Streamlit file_uploader 回傳的 UploadedFile 物件清單。
-
-    uploaded_files: list of streamlit UploadedFile
-                    每個物件需有 .name (str) 與 .read() → bytes。
-
-    回傳與 load_all_csv 相同的 (records, file_warnings)。
-    不會修改任何原始 CSV，所有讀取皆為 in-memory。
-    """
-    field_aliases = rules.get("field_aliases", {})
-    encodings = rules.get("csv_encodings", ["utf-8-sig", "utf-8", "big5", "cp950", "gb18030"])
-    alias_lookup = _build_alias_lookup(field_aliases)
-
-    records = []
-    file_warnings = []
-
-    if not uploaded_files:
-        file_warnings.append("沒有上傳任何 CSV 檔案。")
-        return records, file_warnings
-
-    for uf in uploaded_files:
-        filename = uf.name
-        raw_bytes = uf.read()
-
-        header, rows, used_enc = _read_bytes_with_fallback_encoding(raw_bytes, encodings)
-
-        if "編碼可能有誤" in used_enc:
-            file_warnings.append(
-                f"{filename}: 所有預設編碼皆讀取失敗，已以 utf-8 並替換無法解碼字元的方式讀取，內容可能有誤。"
+def read_csv_with_encoding(file_path):
+    """讀取 CSV，自動偵測編碼。回傳 (DataFrame, encoding_str)。"""
+    enc = detect_encoding(file_path)
+    candidates = [enc] + [e for e in ENCODINGS_TO_TRY if e != enc]
+    last_err = None
+    for attempt_enc in candidates:
+        try:
+            df = pd.read_csv(
+                file_path,
+                encoding=attempt_enc,
+                dtype=str,
+                keep_default_na=False,  # 避免 'N'、'NA' 等被轉成 NaN
+                na_values=[''],
             )
+            # 去除欄位名稱前後空白
+            df.columns = [c.strip() for c in df.columns]
+            return df, attempt_enc
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f'無法讀取 CSV（已嘗試所有編碼）：{last_err}')
 
-        file_records = _process_file_rows(filename, header, rows, alias_lookup, file_warnings)
-        records.extend(file_records)
 
-    return records, file_warnings
+def merge_aliases(config_aliases):
+    """將設定檔的別名合併到預設別名（設定檔優先）。"""
+    merged = {k: list(v) for k, v in DEFAULT_COLUMN_ALIASES.items()}
+    for key, vals in config_aliases.items():
+        if key in merged:
+            # 設定檔中的別名放最前面（優先比對）
+            existing = merged[key]
+            new_unique = [v for v in vals if v not in existing]
+            merged[key] = new_unique + existing
+        else:
+            merged[key] = list(vals)
+    return merged
+
+
+def map_columns(df_columns, aliases):
+    """
+    依別名清單找出 CSV 欄位對應的標準欄位名。
+    回傳 dict: {std_name: csv_column_name}
+    """
+    col_lower = {c.strip().lower(): c for c in df_columns}
+    result = {}
+    for std_name, alias_list in aliases.items():
+        for alias in alias_list:
+            alias_stripped = alias.strip()
+            # 精確比對
+            if alias_stripped in df_columns:
+                result[std_name] = alias_stripped
+                break
+            # 大小寫不分比對
+            if alias_stripped.lower() in col_lower:
+                result[std_name] = col_lower[alias_stripped.lower()]
+                break
+    return result
+
+
+def load_all_csvs(input_dir, config_path):
+    """
+    讀取 input_dir 內所有 CSV，回傳：
+      df_std   : 標準化 DataFrame
+      file_meta: {filename: {'col_map': dict, 'missing_cols': list, 'encoding': str}}
+      load_errors: [{'file': str, 'error': str}]
+    """
+    config = load_config(config_path)
+    config_aliases = config.get('column_aliases', {})
+    aliases = merge_aliases(config_aliases)
+
+    # 尋找 CSV（不遞迴，只找第一層）
+    pattern_lower = os.path.join(input_dir, '*.csv')
+    pattern_upper = os.path.join(input_dir, '*.CSV')
+    csv_files = sorted(set(
+        glob.glob(pattern_lower) + glob.glob(pattern_upper)
+    ))
+
+    if not csv_files:
+        print(f'[警告] {input_dir} 內找不到任何 CSV 檔案。')
+        return pd.DataFrame(), {}, []
+
+    all_records = []
+    file_meta = {}
+    load_errors = []
+
+    for csv_file in csv_files:
+        filename = os.path.basename(csv_file)
+        print(f'\n讀取: {filename}')
+
+        try:
+            df_raw, encoding = read_csv_with_encoding(csv_file)
+        except RuntimeError as e:
+            msg = str(e)
+            print(f'  [錯誤] {msg}')
+            load_errors.append({'file': filename, 'error': msg})
+            continue
+
+        print(f'  編碼: {encoding}，共 {len(df_raw)} 列，欄位: {list(df_raw.columns)}')
+
+        col_map = map_columns(list(df_raw.columns), aliases)
+        missing_cols = [k for k in STD_FIELDS if k not in col_map]
+
+        print(f'  欄位對應: {col_map}')
+        if missing_cols:
+            print(f'  [警告] 未找到對應欄位: {missing_cols}')
+
+        file_meta[filename] = {
+            'col_map': col_map,
+            'missing_cols': missing_cols,
+            'encoding': encoding,
+        }
+
+        # 建立標準化列
+        records = []
+        for i, (_, row) in enumerate(df_raw.iterrows()):
+            rec = {
+                '_source_file': filename,
+                '_original_row': i + 2,  # CSV 第 1 列為標題，資料從第 2 列起
+            }
+            for std_name in STD_FIELDS:
+                if std_name in col_map:
+                    raw_val = row.get(col_map[std_name])
+                    # 空字串統一轉 None
+                    rec[f'raw_{std_name}'] = raw_val if (raw_val is not None and str(raw_val).strip() != '') else None
+                else:
+                    rec[f'raw_{std_name}'] = None
+            records.append(rec)
+
+        df_std = pd.DataFrame(records)
+        all_records.append(df_std)
+
+    if not all_records:
+        return pd.DataFrame(), file_meta, load_errors
+
+    combined = pd.concat(all_records, ignore_index=True)
+    print(f'\n共載入 {len(combined)} 筆資料（來自 {len(all_records)} 個檔案）')
+    return combined, file_meta, load_errors
+
+
+# ============================================================
+# Streamlit 版：接受 UploadedFile 物件列表
+# ============================================================
+
+def _parse_uploaded_file(uploaded_file, aliases):
+    """讀取單一 Streamlit UploadedFile，回傳 (df_std, meta) 或 (None, error_str)。"""
+    filename = uploaded_file.name
+    content = uploaded_file.read()
+
+    df_raw = None
+    encoding = None
+    for enc in ENCODINGS_TO_TRY:
+        try:
+            df_raw = pd.read_csv(
+                io.BytesIO(content),
+                encoding=enc,
+                dtype=str,
+                keep_default_na=False,
+                na_values=[''],
+            )
+            df_raw.columns = [c.strip() for c in df_raw.columns]
+            encoding = enc
+            break
+        except Exception:
+            continue
+
+    if df_raw is None:
+        return None, None, f'無法解析（已嘗試所有編碼）'
+
+    col_map = map_columns(list(df_raw.columns), aliases)
+    missing_cols = [k for k in STD_FIELDS if k not in col_map]
+
+    meta = {'col_map': col_map, 'missing_cols': missing_cols, 'encoding': encoding}
+
+    records = []
+    for i, (_, row) in enumerate(df_raw.iterrows()):
+        rec = {'_source_file': filename, '_original_row': i + 2}
+        for std_name in STD_FIELDS:
+            if std_name in col_map:
+                raw_val = row.get(col_map[std_name])
+                rec[f'raw_{std_name}'] = raw_val if (raw_val is not None and str(raw_val).strip() != '') else None
+            else:
+                rec[f'raw_{std_name}'] = None
+        records.append(rec)
+
+    return pd.DataFrame(records), meta, None
+
+
+def load_uploaded_csvs(uploaded_files, config_path):
+    """
+    Streamlit 版 load_all_csvs：接受 st.file_uploader 回傳的 UploadedFile 列表。
+    回傳 (df_std, file_meta, load_errors)，格式與 load_all_csvs 相同。
+    """
+    config = load_config(config_path)
+    config_aliases = config.get('column_aliases', {})
+    aliases = merge_aliases(config_aliases)
+
+    all_records = []
+    file_meta = {}
+    load_errors = []
+
+    for uploaded_file in uploaded_files:
+        filename = uploaded_file.name
+        df_std, meta, err = _parse_uploaded_file(uploaded_file, aliases)
+        if err:
+            load_errors.append({'file': filename, 'error': err})
+            continue
+        file_meta[filename] = meta
+        all_records.append(df_std)
+
+    if not all_records:
+        return pd.DataFrame(), file_meta, load_errors
+
+    combined = pd.concat(all_records, ignore_index=True)
+    return combined, file_meta, load_errors
