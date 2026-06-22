@@ -221,58 +221,68 @@ def get_facility_type(category_code):
     return '其他設施'
 
 
-_PIPELINE_BASE_COLS = [
+_PIPELINE_ATTR_COLS = [
     '類別碼', '識別碼', '起點編號', '終點編號', '管理單位', '作業區分', '設置日期',
     '管線編號', '尺寸單位', '管徑寬度', '管徑高度', '涵管條數', '管線材料',
     '起點埋設深度', '終點埋設深度', '管線長度', '管線型態', '使用狀態', '資料狀態',
-    '備註', '壓力區分', '輸送物質', '管線識別碼', '點位數量',
+    '備註', '壓力區分', '輸送物質', '參考模型代碼', '旋轉角',
 ]
-_PIPELINE_TAIL_COLS = ['來源CSV', '判讀狀態', '問題類型', '人工備註']
+_PIPELINE_FIXED_COUNT = 37
+
+def _pipeline_fixed_cols():
+    """回傳管線分類表前 37 欄（屬性 + 擴充欄位填滿至 37）。"""
+    cols = list(_PIPELINE_ATTR_COLS)
+    while len(cols) < _PIPELINE_FIXED_COUNT:
+        cols.append(f'擴充欄位{len(cols) + 1}')
+    return cols
+
+_PIPELINE_BASE_COLS = _pipeline_fixed_cols()
+_PIPELINE_TAIL_COLS = []
 
 FACILITY_SCHEMAS = {
-    '管線': None,  # 動態欄位（橫向展開點位座標），由 build_classification_df 處理
+    '管線': None,
     '人手孔': [
         '類別碼', '識別碼', '管理單位', '作業區分', '設置日期', '人手孔編號',
         '孔蓋種類', '尺寸單位', '蓋部寬度', '蓋部長度', '閘門名稱', '地盤高',
         '孔深', '孔蓋型態', '使用狀態', '資料狀態', '內容物', '備註',
-        'X', 'Y', 'Z', 'd', '來源CSV', '原始列號', '判讀狀態', '問題類型', '人工備註',
+        '參考模型代碼', '旋轉角', 'X', 'Y', 'Z', 'd',
     ],
     '開關閥': [
         '類別碼', '識別碼', '管理單位', '作業區分', '設置日期', '開關閥編號',
         '閥類編號', '口徑', '名稱', '地盤高', '埋設深度', '開關閥型態',
-        '使用狀態', '資料狀態', '備註',
-        'X', 'Y', 'Z', 'd', '來源CSV', '原始列號', '判讀狀態', '問題類型', '人工備註',
+        '使用狀態', '資料狀態', '備註', '參考模型代碼', '旋轉角',
+        'X', 'Y', 'Z', 'd',
     ],
     '消防栓': [
         '類別碼', '識別碼', '管理單位', '作業區分', '設置日期', '消防栓編號',
         '管身口徑', '出水口口徑', '埋設深度', '消防栓型態', '使用狀態', '資料狀態', '備註',
-        'X', 'Y', 'Z', 'd', '來源CSV', '原始列號', '判讀狀態', '問題類型', '人工備註',
+        '參考模型代碼', '旋轉角', 'X', 'Y', 'Z', 'd',
     ],
     '電桿': [
         '類別碼', '識別碼', '管理單位', '作業區分', '設置日期', '電桿編號',
         '長度', '材質', '使用狀態', '資料狀態', '備註',
-        'X', 'Y', 'Z', 'd', '來源CSV', '原始列號', '判讀狀態', '問題類型', '人工備註',
+        '參考模型代碼', '旋轉角', 'X', 'Y', 'Z', 'd',
     ],
     '號誌': [
         '類別碼', '識別碼', '管理單位', '作業區分', '設置日期', '號誌編號',
         '號誌種類', '號誌架設方式', '長度', '使用狀態', '資料狀態', '備註',
-        'X', 'Y', 'Z', 'd', '來源CSV', '原始列號', '判讀狀態', '問題類型', '人工備註',
+        '參考模型代碼', '旋轉角', 'X', 'Y', 'Z', 'd',
     ],
     '其他設施': [
         '類別碼', '識別碼', '管理單位', '作業區分', '設置日期', '設施編號',
         '設施名稱', '設施長度', '設施寬度', '設施高度', '設施型態',
-        '使用狀態', '資料狀態', '備註',
-        'X', 'Y', 'Z', 'd', '來源CSV', '原始列號', '判讀狀態', '問題類型', '人工備註',
+        '使用狀態', '資料狀態', '備註', '參考模型代碼', '旋轉角',
+        'X', 'Y', 'Z', 'd',
     ],
     '維護口': [
         '類別碼', '識別碼', '管理單位', '作業區分', '設置日期', '維護口編號',
         '名稱', '使用狀態', '資料狀態', '備註',
-        'X', 'Y', 'Z', 'd', '來源CSV', '原始列號', '判讀狀態', '問題類型', '人工備註',
+        '參考模型代碼', '旋轉角', 'X', 'Y', 'Z', 'd',
     ],
     '場站': [
         '類別碼', '識別碼', '管理單位', '作業區分', '設置日期', '場站名稱',
-        '使用狀態', '資料狀態', '備註',
-        'X', 'Y', 'Z', 'd', '來源CSV', '原始列號', '判讀狀態', '問題類型', '人工備註',
+        '使用狀態', '資料狀態', '備註', '參考模型代碼', '旋轉角',
+        'X', 'Y', 'Z', 'd',
     ],
 }
 
@@ -310,9 +320,9 @@ def _row_to_cls_dict(row, schema_cols):
 
 
 def _build_pipeline_classification(fdf):
-    """管線：依 edited_pipeline_id 群組，每條管線一列，點位座標橫向展開。"""
+    """管線：依 edited_pipeline_id 群組，每條管線一列，點位座標從第 38 欄橫向展開。"""
     if fdf.empty:
-        return pd.DataFrame(columns=_PIPELINE_BASE_COLS + _PIPELINE_TAIL_COLS)
+        return pd.DataFrame(columns=_PIPELINE_BASE_COLS)
 
     def _pno_key(r):
         v = r.get('edited_point_no_int')
@@ -339,14 +349,6 @@ def _build_pipeline_classification(fdf):
         base = {col: '' for col in _PIPELINE_BASE_COLS}
         base['類別碼']     = _vstr(first.get('edited_category'))
         base['識別碼']     = _vstr(first.get('edited_raw_id'))
-        base['管線識別碼'] = _vstr(first.get('edited_pipeline_id'))
-        base['點位數量']   = str(len(pts_sorted))
-
-        tail = {col: '' for col in _PIPELINE_TAIL_COLS}
-        tail['來源CSV']  = _vstr(first.get('_source_file'))
-        tail['判讀狀態'] = _vstr(first.get('review_status'))
-        tail['問題類型'] = _vstr(first.get('problem_type'))
-        tail['人工備註'] = _vstr(first.get('manual_note'))
 
         pt_data = {}
         for n, pt in enumerate(pts_sorted, 1):
@@ -355,12 +357,11 @@ def _build_pipeline_classification(fdf):
             pt_data[f'第{n}點Z'] = _vstr(pt.get('edited_z'))
             pt_data[f'第{n}點d'] = ''
 
-        pipeline_rows.append({**base, **pt_data, **tail})
+        pipeline_rows.append({**base, **pt_data})
 
     all_cols = list(_PIPELINE_BASE_COLS)
     for n in range(1, max_pts + 1):
         all_cols += [f'第{n}點X', f'第{n}點Y', f'第{n}點Z', f'第{n}點d']
-    all_cols += list(_PIPELINE_TAIL_COLS)
 
     df = pd.DataFrame(pipeline_rows)
     for col in all_cols:
@@ -754,6 +755,69 @@ def restore_excluded(edited_df, edit_log_df, point_keys):
             '未判讀', '無', str(edited_df.loc[i, 'manual_note']), '是',
         )
     return edited_df, edit_log_df
+
+
+def reverse_pipeline_order(edited_df, edit_log_df, pipeline_id):
+    """
+    將同一管線識別碼下所有點位的點號順序反轉。
+    例如點號 1,2,3,4,5,6 → 重新指派為 6→1, 5→2, 4→3, 3→4, 2→5, 1→6。
+    回傳 (edited_df, edit_log_df, result_msg)。
+    """
+    edited_df = edited_df.copy()
+    pid = str(pipeline_id or '').strip()
+    if not pid:
+        return edited_df, edit_log_df, '管線識別碼為空，無法執行。'
+
+    mask = edited_df['edited_pipeline_id'].astype(str).str.strip() == pid
+    idxs = edited_df.index[mask].tolist()
+    if len(idxs) <= 1:
+        return edited_df, edit_log_df, f'此管線只有 {len(idxs)} 個點，無需排序轉向。'
+
+    def _pno_int(i):
+        v = edited_df.loc[i, 'edited_point_no_int']
+        try:
+            if v is None or pd.isna(v):
+                return None
+            return int(v)
+        except Exception:
+            return None
+
+    pno_vals = [_pno_int(i) for i in idxs]
+    if any(v is None for v in pno_vals):
+        return edited_df, edit_log_df, '此管線點號無法完整解析，請先修正點號後再執行排序轉向。'
+
+    sorted_pairs = sorted(zip(idxs, pno_vals), key=lambda x: x[1])
+    sorted_idxs = [p[0] for p in sorted_pairs]
+    old_pnos = [p[1] for p in sorted_pairs]
+    new_pnos = list(reversed(range(1, len(sorted_idxs) + 1)))
+
+    old_order_str = '→'.join(str(p) for p in old_pnos)
+    new_order_str = '→'.join(str(p) for p in list(reversed(old_pnos)))
+
+    before_snap = _row_snapshot(edited_df.loc[sorted_idxs[0]].to_dict(), _SNAP_FIELDS)
+
+    for idx_pos, df_idx in enumerate(sorted_idxs):
+        new_pno = len(sorted_idxs) - idx_pos
+        edited_df.loc[df_idx, 'edited_point_no']     = str(new_pno)
+        edited_df.loc[df_idx, 'edited_point_no_int'] = new_pno
+        edited_df.loc[df_idx, 'is_modified']         = True
+
+    after_snap = _row_snapshot(edited_df.loc[sorted_idxs[0]].to_dict(), _SNAP_FIELDS)
+
+    first = edited_df.loc[sorted_idxs[0]]
+    orig_info = {
+        '_source_file':  first.get('_source_file'),
+        '_original_row': first.get('_original_row'),
+        'raw_id':        first.get('raw_id'),
+    }
+    note = (f'管線 {pid} 點位順序已反轉（{len(sorted_idxs)} 點），'
+            f'原順序 {old_order_str}，新順序 {new_order_str}')
+    edit_log_df = _save_log(
+        edit_log_df, f'pipeline:{pid}', '點位排序轉向', orig_info,
+        before_snap, after_snap,
+        '', '', note, '',
+    )
+    return edited_df, edit_log_df, f'已反轉管線 {pid} 的 {len(sorted_idxs)} 個點位順序。'
 
 
 def clear_all_edits(edited_df, original_df, edit_log_df):
