@@ -455,13 +455,23 @@ def _xml_escape(s):
 def export_gml_wide_csv_bytes(cls_df, facility_type='管線'):
     """
     將分類表 DataFrame 輸出為 GML 專用寬表 CSV (BOM UTF-8)。
-    管線已是寬表格式（第N點X/Y/Z/d），直接輸出。
-    點狀設施直接輸出其欄位。
+    管線座標欄位 rename 為 E/N/Z/d（重複表頭）。
     """
     if cls_df is None or cls_df.empty:
         return b''
     buf = io.BytesIO()
     buf.write(b'\xef\xbb\xbf')  # BOM
-    cls_df.to_csv(buf, index=False, encoding='utf-8')
+    if facility_type == '管線':
+        from src.v3_helpers import pipeline_export_rename
+        import csv
+        headers, rows = pipeline_export_rename(cls_df)
+        text_wrapper = io.TextIOWrapper(buf, encoding='utf-8', newline='')
+        writer = csv.writer(text_wrapper)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(row)
+        text_wrapper.detach()
+    else:
+        cls_df.to_csv(buf, index=False, encoding='utf-8')
     buf.seek(0)
     return buf.read()

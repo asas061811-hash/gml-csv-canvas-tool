@@ -1,5 +1,5 @@
 """
-app.py - GML 點位處理工具 第 0.5 版
+app.py - GML 點位處理工具 V0.6 版
 
 佈局：
   左側 sidebar ─ 功能模式切換（資料整理 / GML 輸出）+ 模式專屬控制
@@ -9,11 +9,13 @@ app.py - GML 點位處理工具 第 0.5 版
 """
 
 import hashlib
+import io
 import math
 import os
 import sys
 import time
 
+import openpyxl
 import pandas as pd
 import plotly.io as pio
 import streamlit as st
@@ -50,11 +52,21 @@ from src.v3_helpers import (
     get_facility_type,
     init_edit_log,
     init_edited_points_df,
+    pipeline_export_rename,
     quick_mark,
     restore_excluded,
     restore_point,
     reverse_pipeline_order,
     save_point_edit,
+)
+from src.attribute_merger import (
+    load_code_mappings,
+    load_definition_excel,
+    merge_definition_attributes,
+    convert_definition_to_code,
+    convert_code_to_definition,
+    build_code_definition_table,
+    validate_merge_result,
 )
 from src.gml_generator import (
     TARGET_OPTIONS,
@@ -339,7 +351,7 @@ def render_edit_panel(edited_df, original_df, anomaly_set):
 
 def main():
     st.set_page_config(
-        page_title='GML 點位處理工具 第 0.5 版',
+        page_title='GML 點位處理工具 V0.6 版',
         page_icon='📍',
         layout='wide',
         initial_sidebar_state='expanded',
@@ -372,6 +384,8 @@ def main():
         ('gml_result_errors', []),
         ('gml_result_facility', ''),
         ('gml_result_target', ''),
+        ('attr_merged', {}),
+        ('attr_code_dfs', {}),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -381,7 +395,7 @@ def main():
     # ════════════════════════════════════════════════
     with st.sidebar:
         st.title('📍 GML 點位處理工具')
-        st.caption('第 0.5 版')
+        st.caption('V0.6 版')
         st.divider()
 
         # ── 功能模式切換 ───────────────────────────
@@ -547,7 +561,7 @@ def main():
     # ════════════════════════════════════════════════
     if not st.session_state.processed and app_mode == '資料整理':
         st.markdown("""
-## 歡迎使用 GML 點位處理工具 第 0.5 版
+## 歡迎使用 GML 點位處理工具 V0.6 版
 
 ### 第一階段：資料整理
 1. 在左側 **① 上傳 CSV** — 可多選
@@ -625,7 +639,7 @@ def _render_data_mode(original_df, anomaly_list, dup_list, anomaly_set):
         event = st.plotly_chart(
             fig, use_container_width=True,
             config={'scrollZoom': True, 'displayModeBar': True,
-                    'toImageButtonOptions': {'format': 'png', 'filename': 'GML_點位畫布_v0_5',
+                    'toImageButtonOptions': {'format': 'png', 'filename': 'GML_點位畫布_v0_6',
                                              'height': 1000, 'width': 1600}},
             on_select='rerun', selection_mode='points', key='v3_canvas',
         )
@@ -657,6 +671,7 @@ def _render_data_mode(original_df, anomaly_list, dup_list, anomaly_set):
         '🔄 重複量測比對',
         '📝 修正紀錄',
         '📊 分類表',
+        '🔗 設施屬性合併',
         '📥 下載',
     ])
 
@@ -726,8 +741,12 @@ def _render_data_mode(original_df, anomaly_list, dup_list, anomaly_set):
     with tabs[5]:
         _render_tab_classification()
 
-    # Tab 6：下載
+    # Tab 6：設施屬性合併
     with tabs[6]:
+        _render_tab_attribute_merge()
+
+    # Tab 7：下載
+    with tabs[7]:
         _render_tab_download(original_df, anomaly_list, dup_list, anomaly_set)
 
 
@@ -836,6 +855,16 @@ def _render_tab_classification():
         st.caption(f'{sel_type}｜共 {n_rows} {unit}｜欄位數：{len(cls_df.columns)}')
 
         cls_ed = cls_df.copy().reset_index(drop=True)
+        # 管線型：將 第N點X/Y/Z/d rename 為 E/N/Z/d（加序號避免重複）
+        if sel_type == '管線':
+            rename_map = {}
+            for c in cls_ed.columns:
+                for suffix, repl in [('X', 'E'), ('Y', 'N'), ('Z', 'Z'), ('d', 'd')]:
+                    if c.startswith('第') and c.endswith(f'點{suffix}'):
+                        n = c[1:c.index('點')]
+                        rename_map[c] = f'{repl}({n})'
+                        break
+            cls_ed = cls_ed.rename(columns=rename_map)
         cls_ed.insert(0, '刪除', False)
 
         edited_cls = st.data_editor(
@@ -886,19 +915,230 @@ def _render_tab_classification():
     st.caption('d = 埋設深度（公尺）。管線表每條管線佔一列，點位座標以「第N點X/Y/Z/d」橫向展開。')
 
 
+def _render_tab_attribute_merge():
+    st.subheader('設施屬性合併')
+    st.caption(
+        '上傳人工填寫的「分類表_定義版」Excel，系統將自動與點位分類表合併屬性，'
+        '並產生定義版、代碼版、代碼定義對照版三種成果。')
+
+    code_maps = load_code_mappings(CONFIG_PATH)
+
+    uploaded_def = st.file_uploader(
+        '上傳分類表_定義版 Excel（.xlsx）',
+        type=['xlsx'],
+        key='attr_merge_upload',
+        help='工作表名稱可為：管線 / 分類表_管線 / 分類表_管線_定義版 等，系統會自動辨識。',
+    )
+
+    if uploaded_def is None:
+        st.info('請上傳人工填寫的分類表_定義版 Excel，系統將與目前點位分類表合併。')
+        _render_attr_merge_flow_chart()
+        return
+
+    def_sheets, err = load_definition_excel(uploaded_def)
+    if err:
+        st.error(err)
+        return
+    if not def_sheets:
+        st.warning('未在 Excel 中找到可辨識的設施分類工作表。')
+        return
+
+    st.success(f'已辨識 {len(def_sheets)} 個設施類型：{", ".join(def_sheets.keys())}')
+
+    edf = st.session_state.edited_points_df
+    all_merged = {}
+    all_unmatched = {}
+    all_unfilled = {}
+    all_code_errors = []
+    total_merged = 0
+
+    for ft, def_df in def_sheets.items():
+        cls_df = build_classification_df(edf, ft, include_excluded=False)
+        if cls_df.empty:
+            continue
+        merged, unmatched, unfilled = merge_definition_attributes(cls_df, def_df, ft)
+        all_merged[ft] = merged
+        if not unmatched.empty:
+            all_unmatched[ft] = unmatched
+        if not unfilled.empty:
+            all_unfilled[ft] = unfilled
+        total_merged += len(merged)
+
+    if not all_merged:
+        st.warning('沒有任何設施類型成功合併。請確認定義版工作表與目前資料的設施類型是否一致。')
+        return
+
+    st.session_state['attr_merged'] = all_merged
+
+    st.divider()
+    st.markdown('#### 合併結果')
+
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric('成功合併', f'{total_merged} 筆')
+    mc2.metric('未匹配屬性', f'{sum(len(v) for v in all_unmatched.values())} 筆')
+    mc3.metric('屬性未填', f'{sum(len(v) for v in all_unfilled.values())} 筆')
+
+    for ft, merged_df in all_merged.items():
+        with st.expander(f'{ft}（{len(merged_df)} 筆）', expanded=False):
+            st.dataframe(merged_df, use_container_width=True, hide_index=True)
+
+    if all_unmatched:
+        with st.expander(f'⚠️ 未匹配屬性資料（定義版有，點位表無）', expanded=False):
+            for ft, udf in all_unmatched.items():
+                st.caption(f'**{ft}**：{len(udf)} 筆')
+                st.dataframe(udf, use_container_width=True, hide_index=True)
+
+    if all_unfilled:
+        with st.expander(f'⚠️ 屬性未填資料（點位表有，定義版無）', expanded=False):
+            for ft, udf in all_unfilled.items():
+                st.caption(f'**{ft}**：{len(udf)} 筆')
+                st.dataframe(udf, use_container_width=True, hide_index=True)
+
+    # ── 產生三版本 ─────────────────────────────────
+    st.divider()
+    st.markdown('#### 下載三版本成果')
+
+    all_code_dfs = {}
+    all_convert_errors = []
+    for ft, mdf in all_merged.items():
+        code_df, errs = convert_definition_to_code(mdf, code_maps)
+        all_code_dfs[ft] = code_df
+        for e in errs:
+            e['facility'] = ft
+        all_convert_errors.extend(errs)
+
+    if all_convert_errors:
+        st.warning(f'代碼轉換異常：{len(all_convert_errors)} 筆')
+        with st.expander('代碼轉換異常明細', expanded=False):
+            st.dataframe(pd.DataFrame(all_convert_errors), use_container_width=True, hide_index=True)
+
+    dc1, dc2, dc3 = st.columns(3)
+
+    # 定義版
+    with dc1:
+        def_buf = _export_merged_excel(all_merged, '定義版')
+        st.download_button('📥 下載分類表_定義版',
+            data=def_buf, file_name='分類表_定義版.xlsx', mime=_MIME_XLSX,
+            use_container_width=True, key='dl_attr_def')
+
+    # 代碼版
+    with dc2:
+        code_buf = _export_merged_excel(all_code_dfs, '代碼版')
+        st.download_button('📥 下載分類表_代碼版',
+            data=code_buf, file_name='分類表_代碼版.xlsx', mime=_MIME_XLSX,
+            use_container_width=True, key='dl_attr_code')
+
+    # 對照版
+    with dc3:
+        ref_dfs = {}
+        for ft, cdf in all_code_dfs.items():
+            ref_dfs[ft] = build_code_definition_table(cdf, code_maps)
+        ref_buf = _export_merged_excel(ref_dfs, '對照版')
+        st.download_button('📥 下載分類表_對照版',
+            data=ref_buf, file_name='分類表_代碼定義對照版.xlsx', mime=_MIME_XLSX,
+            use_container_width=True, key='dl_attr_ref')
+
+    st.session_state['attr_code_dfs'] = all_code_dfs
+
+
+def _export_merged_excel(dfs_dict, version_label):
+    """將 {設施類型: DataFrame} 輸出為多工作表 Excel BytesIO。"""
+    wb = openpyxl.Workbook()
+    first = True
+    for ft, df in dfs_dict.items():
+        if first:
+            ws = wb.active
+            first = False
+        else:
+            ws = wb.create_sheet()
+        ws.title = f'{ft}_{version_label}'
+        if df is not None and not df.empty:
+            headers = list(df.columns)
+            for c, h in enumerate(headers, 1):
+                ws.cell(row=1, column=c, value=h)
+            for r, (_, row) in enumerate(df.iterrows(), 2):
+                for c, h in enumerate(headers, 1):
+                    v = row[h]
+                    if v is None or (isinstance(v, float) and math.isnan(v)):
+                        v = ''
+                    ws.cell(row=r, column=c, value=v)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def _render_attr_merge_flow_chart():
+    st.markdown("""
+---
+**正式流程：**
+
+1. 工具完成點位整理 → 產生分類表點位資料
+2. 下載分類表（下載頁籤），人工填寫屬性欄位 → 另存為「分類表_定義版」
+3. 上傳「分類表_定義版」回本頁
+4. 系統自動合併屬性 + 產生定義版/代碼版/對照版
+5. GML 輸出使用代碼版
+
+**人工建議填定義內容（如「使用」、「地下」、「mm」），不建議直接填代碼。**
+工具會自動將定義文字轉為標準代碼。
+    """)
+
+
+def _build_versioned_cls_bytes(edited_df, facility_type, version, code_maps):
+    """
+    產生指定版本的分類表 Excel bytes。
+    version: '定義版' / '代碼版' / '對照版'
+    """
+    from src.v3_helpers import pipeline_export_rename, _write_sheet, _CLS_SHEET_FILLS
+
+    types_to_export = FACILITY_TYPES if facility_type == '全部設施' else [facility_type]
+    wb = openpyxl.Workbook()
+    first = True
+
+    for idx, ft in enumerate(types_to_export):
+        ws = wb.active if first else wb.create_sheet()
+        first = False
+        ws.title = f'{ft}_{version}'
+        cls_df = build_classification_df(edited_df, ft, include_excluded=False)
+        if cls_df.empty:
+            continue
+
+        if version == '定義版':
+            out_df = convert_code_to_definition(cls_df, code_maps)
+        elif version == '代碼版':
+            out_df, _ = convert_definition_to_code(cls_df, code_maps)
+        else:  # 對照版
+            code_df, _ = convert_definition_to_code(cls_df, code_maps)
+            out_df = build_code_definition_table(code_df, code_maps)
+
+        fill = _CLS_SHEET_FILLS[FACILITY_TYPES.index(ft)] if ft in FACILITY_TYPES else 'blue'
+        if ft == '管線':
+            headers, rows = pipeline_export_rename(out_df)
+            _write_sheet(ws, headers, rows, fill)
+        else:
+            _write_sheet(ws, list(out_df.columns), out_df.to_dict('records'), fill)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
 def _render_tab_download(original_df, anomaly_list, dup_list, anomaly_set):
     st.subheader('下載成果檔案')
 
     # 1. 整合成果 Excel
-    st.markdown('#### 📊 整合成果 Excel（16 工作表）')
+    _dl_code_maps = load_code_mappings(CONFIG_PATH)
+    st.markdown('#### 📊 整合成果 Excel')
     v_bytes = export_v3_bytes(
         original_df, st.session_state.edited_points_df,
-        st.session_state.edit_log_df, anomaly_list, dup_list)
+        st.session_state.edit_log_df, anomaly_list, dup_list,
+        code_mappings=_dl_code_maps)
     n_mod_dl = int(st.session_state.edited_points_df['is_modified'].sum())
     n_log_dl = len(st.session_state.edit_log_df) if st.session_state.edit_log_df is not None else 0
     st.download_button(
-        f'📥 GML處理成果_v0_5.xlsx　（含 {n_mod_dl} 筆修正、{n_log_dl} 筆紀錄）',
-        data=v_bytes, file_name='GML處理成果_v0_5.xlsx', mime=_MIME_XLSX)
+        f'📥 GML處理成果_v0_6.xlsx　（含 {n_mod_dl} 筆修正、{n_log_dl} 筆紀錄）',
+        data=v_bytes, file_name='GML處理成果_v0_6.xlsx', mime=_MIME_XLSX)
     n_excl_dl = int(st.session_state.edited_points_df.apply(_is_excl, axis=1).sum())
     st.caption(
         f'修正後點位表 / 人工判讀紀錄表 / 分類表：僅含納入成果的點位。'
@@ -908,24 +1148,35 @@ def _render_tab_download(original_df, anomaly_list, dup_list, anomaly_set):
 
     st.divider()
 
-    # 2. 分類表 Excel 下載
+    # 2. 分類表 Excel 下載（三版本）
     st.markdown('#### 📂 分類表 Excel 下載')
-    st.caption('每個按鈕輸出單一設施類型；欄位依公共設施屬性項目表規則排列，預設不含已排除資料。')
+    st.caption('每種版本均含全部設施與各設施個別下載。定義版供 BIM/人工檢查，代碼版供 GML/廠商，對照版供查核。')
     _cls_dl_edf = st.session_state.edited_points_df
-    st.download_button(
-        '📥 下載全部分類 Excel',
-        data=export_classification_bytes(_cls_dl_edf, '全部設施'),
-        file_name='分類表_全部設施.xlsx', mime=_MIME_XLSX, use_container_width=True)
-    _cls_rows = [FACILITY_TYPES[i:i+3] for i in range(0, len(FACILITY_TYPES), 3)]
-    for _row_types in _cls_rows:
-        _btn_cols = st.columns(3)
-        for _col, _ft in zip(_btn_cols, _row_types):
-            with _col:
-                st.download_button(
-                    f'📥 下載{_ft} Excel',
-                    data=export_classification_bytes(_cls_dl_edf, _ft),
-                    file_name=f'分類表_{_ft}.xlsx', mime=_MIME_XLSX,
-                    use_container_width=True, key=f'dl_cls_{_ft}')
+    _code_maps = load_code_mappings(CONFIG_PATH)
+
+    ver_tabs = st.tabs(['📄 定義版', '🔢 代碼版', '📋 對照版'])
+
+    for ver_idx, (ver_tab, ver_label, ver_suffix) in enumerate(zip(
+        ver_tabs,
+        ['定義版', '代碼版', '對照版'],
+        ['定義版', '代碼版', '對照版'],
+    )):
+        with ver_tab:
+            st.download_button(
+                f'📥 下載全部分類_{ver_label} Excel',
+                data=_build_versioned_cls_bytes(_cls_dl_edf, '全部設施', ver_suffix, _code_maps),
+                file_name=f'分類表_全部設施_{ver_suffix}.xlsx', mime=_MIME_XLSX,
+                use_container_width=True, key=f'dl_cls_all_{ver_suffix}')
+            _cls_rows = [FACILITY_TYPES[i:i+3] for i in range(0, len(FACILITY_TYPES), 3)]
+            for _row_types in _cls_rows:
+                _btn_cols = st.columns(3)
+                for _col, _ft in zip(_btn_cols, _row_types):
+                    with _col:
+                        st.download_button(
+                            f'📥 {_ft}_{ver_label}',
+                            data=_build_versioned_cls_bytes(_cls_dl_edf, _ft, ver_suffix, _code_maps),
+                            file_name=f'分類表_{_ft}_{ver_suffix}.xlsx', mime=_MIME_XLSX,
+                            use_container_width=True, key=f'dl_cls_{_ft}_{ver_suffix}')
 
     st.divider()
 
@@ -951,8 +1202,8 @@ def _render_tab_download(original_df, anomaly_list, dup_list, anomaly_set):
             selected_key=None, canvas_height=800, show_excluded=False)
         html_str = pio.to_html(fig_dl, include_plotlyjs=True, full_html=True,
                                config={'scrollZoom': True})
-        st.download_button('📥 點位畫布_v0_5.html（修正後）',
-            data=html_str.encode('utf-8'), file_name='點位畫布_v0_5.html',
+        st.download_button('📥 點位畫布_v0_6.html（修正後）',
+            data=html_str.encode('utf-8'), file_name='點位畫布_v0_6.html',
             mime='text/html', use_container_width=True)
         st.caption('HTML 可離線用瀏覽器開啟，反映最新修正結果。')
 
@@ -968,7 +1219,8 @@ def _render_tab_download(original_df, anomaly_list, dup_list, anomaly_set):
         st.markdown('##### 修正紀錄（目前工作階段）')
         log_buf = export_v3_bytes(
             original_df, st.session_state.edited_points_df,
-            st.session_state.edit_log_df, anomaly_list, dup_list)
+            st.session_state.edit_log_df, anomaly_list, dup_list,
+            code_mappings=_dl_code_maps)
         st.download_button('📥 修正後成果_完整版.xlsx',
             data=log_buf, file_name='修正後成果_完整版.xlsx', mime=_MIME_XLSX,
             use_container_width=True)
@@ -1016,7 +1268,7 @@ def _render_gml_mode_tabs():
         gml_cls_df = None
 
         if gml_source == '上傳 GML 專用寬表 CSV':
-            gml_csv_file = st.file_uploader('上傳 GML 專用寬表 CSV', type=['csv'], key='gml_csv_upload_v0_5')
+            gml_csv_file = st.file_uploader('上傳 GML 專用寬表 CSV', type=['csv'], key='gml_csv_upload_v0_6')
             if gml_csv_file is not None:
                 try:
                     gml_cls_df = pd.read_csv(gml_csv_file, dtype=str, keep_default_na=False)
@@ -1024,18 +1276,25 @@ def _render_gml_mode_tabs():
                 except Exception as e:
                     st.error(f'CSV 讀取失敗：{e}')
         elif st.session_state.processed:
-            gml_cls_df = build_classification_df(
-                st.session_state.edited_points_df, gml_facility, include_excluded=False)
-            n_gml_rows = len(gml_cls_df) if gml_cls_df is not None else 0
+            # 優先使用代碼版（若已完成屬性合併）
+            attr_code_dfs = st.session_state.get('attr_code_dfs', {})
+            if gml_facility in attr_code_dfs and not attr_code_dfs[gml_facility].empty:
+                gml_cls_df = attr_code_dfs[gml_facility]
+                st.success(f'使用代碼版資料，{gml_facility}共 {len(gml_cls_df)} 筆（已完成屬性合併與代碼轉換）')
+            else:
+                gml_cls_df = build_classification_df(
+                    st.session_state.edited_points_df, gml_facility, include_excluded=False)
+                st.info(f'使用修正後資料（尚未合併定義版屬性），{gml_facility}分類表共 {len(gml_cls_df)} 筆')
             n_excl_gml = int(st.session_state.edited_points_df.apply(_is_excl, axis=1).sum())
-            st.info(f'使用修正後資料，{gml_facility}分類表共 {n_gml_rows} 筆（已排除 {n_excl_gml} 筆不含在內）')
+            if n_excl_gml:
+                st.caption(f'已排除 {n_excl_gml} 筆不含在內')
 
             if gml_cls_df is not None and not gml_cls_df.empty:
                 csv_bytes = export_gml_wide_csv_bytes(gml_cls_df, gml_facility)
                 st.download_button(
                     f'📥 下載 GML 專用寬表 CSV（{gml_facility}）',
                     data=csv_bytes, file_name=f'GML寬表_{gml_facility}.csv',
-                    mime='text/csv', key='dl_gml_wide_csv_v0_5')
+                    mime='text/csv', key='dl_gml_wide_csv_v0_6')
         else:
             st.warning('請先完成資料整理，或切換資料來源為「上傳 GML 專用寬表 CSV」。')
 
@@ -1045,7 +1304,7 @@ def _render_gml_mode_tabs():
             st.warning(f'⚠️ {TARGET_OPTIONS.get(gml_target, gml_target)} + {gml_facility}：'
                        f'此規範或設施類型尚未實作。\n目前支援：桃園市 + 全部設施類型。')
         elif gml_cls_df is not None and not gml_cls_df.empty:
-            if st.button('🚀 產生 GML', type='primary', key='btn_gen_gml_v0_5'):
+            if st.button('🚀 產生 GML', type='primary', key='btn_gen_gml_v0_6'):
                 with st.spinner('正在產製 GML...'):
                     gml_text, gml_ok, gml_errors = generate_gml(
                         gml_cls_df, gml_target, gml_facility, gml_elevation)
@@ -1094,7 +1353,7 @@ def _render_gml_mode_tabs():
                 data=gml_text.encode('utf-8'),
                 file_name=gml_filename,
                 mime='application/gml+xml',
-                key='dl_gml_file_v0_5',
+                key='dl_gml_file_v0_6',
                 use_container_width=True,
             )
             st.caption(f'檔案大小：{len(gml_text):,} 字元　'

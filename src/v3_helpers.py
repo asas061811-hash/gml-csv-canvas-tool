@@ -370,10 +370,38 @@ def _build_pipeline_classification(fdf):
     return df[all_cols].fillna('')
 
 
+def pipeline_export_rename(df):
+    """
+    將管線分類表的內部欄位名（第N點X/Y/Z/d）重新命名為正式輸出格式（E/N/Z/d 重複）。
+    DataFrame 不允許重複 column name，因此改用 list-of-lists 結構：
+    回傳 (export_headers, export_rows)。
+    export_headers: list[str]，前 37 欄 + 重複的 E/N/Z/d
+    export_rows: list[list]，每列的值
+    """
+    if df is None or df.empty:
+        return list(df.columns), []
+    cols = list(df.columns)
+    headers = []
+    _coord_map = {'X': 'E', 'Y': 'N', 'Z': 'Z', 'd': 'd'}
+    for c in cols:
+        matched = False
+        for suffix, replacement in _coord_map.items():
+            if c.startswith('第') and c.endswith(f'點{suffix}'):
+                headers.append(replacement)
+                matched = True
+                break
+        if not matched:
+            headers.append(c)
+    rows = []
+    for _, row in df.iterrows():
+        rows.append([row[c] for c in cols])
+    return headers, rows
+
+
 def build_classification_df(edited_df, facility_type, include_excluded=False):
     """
-    依設施類型（表 6-9 ～ 表 6-17）建立分類表 DataFrame。
-    - 管線：一條管線一列，點位座標橫向展開（第N點X/Y/Z/d）。
+    依設施類型建立分類表 DataFrame。
+    - 管線：一條管線一列，點位座標橫向展開（內部用第N點X/Y/Z/d，輸出用 pipeline_export_rename）。
     - 其他：一個點位一列，固定欄位，缺少的來源欄位留空。
     - include_excluded=False（預設）：已排除點位不出現在分類表。
     """
@@ -1212,35 +1240,41 @@ def _write_sheet(ws, headers, rows, fill_key='blue'):
 _CLS_SHEET_FILLS = ['blue', 'green', 'teal', 'orange', 'red', 'purple', 'teal', 'green', 'blue']
 
 
+def _write_cls_to_sheet(ws, edited_df, ft, fill_key):
+    """將分類表寫入 Excel sheet，管線型自動 rename 座標欄為 E/N/Z/d。"""
+    cls_df = build_classification_df(edited_df, ft, include_excluded=False)
+    if ft == '管線':
+        headers, rows = pipeline_export_rename(cls_df)
+        _write_sheet(ws, headers, rows, fill_key)
+    else:
+        _write_sheet(ws, list(cls_df.columns), cls_df.to_dict('records'), fill_key)
+
+
 def export_classification_bytes(edited_df, facility_type='全部設施'):
     """
     匯出分類表 Excel BytesIO。
-    facility_type='全部設施' → 輸出 9 張工作表（每種設施一張）。
-    其他 facility_type → 輸出單一設施類型（一張工作表）。
-    預設只含納入成果的點位（已排除不輸出）。
+    facility_type='全部設施' → 輸出 9 張工作表。
+    管線座標欄位自動 rename 為 E/N/Z/d。
     """
     wb = openpyxl.Workbook()
     if facility_type == '全部設施':
         for idx, ft in enumerate(FACILITY_TYPES):
             ws = wb.active if idx == 0 else wb.create_sheet()
             ws.title = f'分類表_{ft}'
-            cls_df = build_classification_df(edited_df, ft, include_excluded=False)
-            _write_sheet(ws, list(cls_df.columns), cls_df.to_dict('records'),
-                         _CLS_SHEET_FILLS[idx])
+            _write_cls_to_sheet(ws, edited_df, ft, _CLS_SHEET_FILLS[idx])
     else:
         idx = FACILITY_TYPES.index(facility_type) if facility_type in FACILITY_TYPES else 0
         ws = wb.active
         ws.title = f'分類表_{facility_type}'
-        cls_df = build_classification_df(edited_df, facility_type, include_excluded=False)
-        _write_sheet(ws, list(cls_df.columns), cls_df.to_dict('records'),
-                     _CLS_SHEET_FILLS[idx])
+        _write_cls_to_sheet(ws, edited_df, facility_type, _CLS_SHEET_FILLS[idx])
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf
 
 
-def export_v3_bytes(original_df, edited_df, edit_log_df, anomaly_list, dup_list):
+def export_v3_bytes(original_df, edited_df, edit_log_df, anomaly_list, dup_list,
+                    code_mappings=None):
     """
     產生 v3 多工作表 Excel BytesIO（16 張工作表）：
       - 6 基礎表（原始解析 / 修正後成果 / 人工判讀 / 修正紀錄 / 異常清單 / 重複量測）
@@ -1334,12 +1368,47 @@ def export_v3_bytes(original_df, edited_df, edit_log_df, anomaly_list, dup_list)
     ]
     _write_sheet(ws6, dup_h, dup_list, 'purple')
 
-    # ── 7-15. 分類表（表 6-9 ～ 表 6-17，僅含納入成果的點位）──
-    for idx, ft in enumerate(FACILITY_TYPES):
-        ws_cls = wb.create_sheet(f'分類表_{ft}')
-        cls_df = build_classification_df(edited_df, ft, include_excluded=False)
-        _write_sheet(ws_cls, list(cls_df.columns), cls_df.to_dict('records'),
-                     _CLS_SHEET_FILLS[idx])
+    # ── 7+. 分類表三版本（定義版/代碼版/對照版）──
+    if code_mappings:
+        from src.attribute_merger import (
+            convert_definition_to_code, convert_code_to_definition,
+            build_code_definition_table,
+        )
+        for idx, ft in enumerate(FACILITY_TYPES):
+            cls_df = build_classification_df(edited_df, ft, include_excluded=False)
+            fill = _CLS_SHEET_FILLS[idx]
+            is_pipe = (ft == '管線')
+
+            # 定義版
+            def_df = convert_code_to_definition(cls_df, code_mappings)
+            ws_def = wb.create_sheet(f'{ft}_定義版')
+            if is_pipe:
+                h, r = pipeline_export_rename(def_df)
+                _write_sheet(ws_def, h, r, fill)
+            else:
+                _write_sheet(ws_def, list(def_df.columns), def_df.to_dict('records'), fill)
+
+            # 代碼版
+            code_df, _ = convert_definition_to_code(cls_df, code_mappings)
+            ws_code = wb.create_sheet(f'{ft}_代碼版')
+            if is_pipe:
+                h, r = pipeline_export_rename(code_df)
+                _write_sheet(ws_code, h, r, fill)
+            else:
+                _write_sheet(ws_code, list(code_df.columns), code_df.to_dict('records'), fill)
+
+            # 對照版
+            ref_df = build_code_definition_table(code_df, code_mappings)
+            ws_ref = wb.create_sheet(f'{ft}_對照版')
+            if is_pipe:
+                h, r = pipeline_export_rename(ref_df)
+                _write_sheet(ws_ref, h, r, fill)
+            else:
+                _write_sheet(ws_ref, list(ref_df.columns), ref_df.to_dict('records'), fill)
+    else:
+        for idx, ft in enumerate(FACILITY_TYPES):
+            ws_cls = wb.create_sheet(f'分類表_{ft}')
+            _write_cls_to_sheet(ws_cls, edited_df, ft, _CLS_SHEET_FILLS[idx])
 
     # ── 16. 已排除資料 ────────────────────────────────
     ws_excl = wb.create_sheet('已排除資料')
