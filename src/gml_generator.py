@@ -1,8 +1,10 @@
 """
 gml_generator.py - GML 產製引擎 Ver 1.0
+build: 2026-06-23
 
 將修正後點位資料或 GML 專用寬表 CSV 轉換為 GML XML 格式。
 支援目標規範：桃園市、國土署、南科/世曦（全設施類型）。
+匯出：validate_gml_input, normalize_target_name, format_date_for_target
 """
 
 import io
