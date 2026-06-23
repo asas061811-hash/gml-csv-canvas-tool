@@ -39,6 +39,7 @@ from src.v3_helpers import (
     INCLUDE_RESULT_OPTIONS,
     PROBLEM_TYPE_OPTIONS,
     REVIEW_STATUS_OPTIONS,
+    add_manual_point,
     build_classification_df,
     build_cls_pkey_list,
     build_figure_v3,
@@ -52,12 +53,14 @@ from src.v3_helpers import (
     get_facility_type,
     init_edit_log,
     init_edited_points_df,
+    is_manual_point,
     pipeline_export_rename,
     quick_mark,
     restore_excluded,
     restore_point,
     reverse_pipeline_order,
     save_point_edit,
+    _next_point_no,
 )
 from src.attribute_merger import (
     load_code_mappings,
@@ -128,6 +131,287 @@ def make_anomaly_styler(anom_df):
 
 
 # ============================================================
+# 人工新增點位面板
+# ============================================================
+
+def render_add_point_panel(edited_df):
+    """
+    右側「新增人工點位」區塊。
+    - 若有選取點位：顯示方式 A（複製新增）+ 方式 B（空白表單）+ 插入
+    - 若無選取點位：顯示方式 B（空白表單，需手動填入管線識別碼）
+    """
+    st.markdown('## ➕ 新增人工點位')
+    selected_key = st.session_state.get('selected_key')
+    edf = edited_df
+
+    # ── 取得目前選取點位資料 ───────────────────────────
+    sel_row = None
+    if selected_key and selected_key in edf['point_key'].values:
+        sel_row = edf[edf['point_key'] == selected_key].iloc[0]
+
+    # ── 決定預設管線識別碼 ─────────────────────────────
+    default_pid = ''
+    default_cat = ''
+    default_date = ''
+    if sel_row is not None:
+        default_pid  = _v(sel_row.get('edited_pipeline_id', ''))
+        default_cat  = _v(sel_row.get('edited_category', ''))
+        default_date = _v(sel_row.get('edited_date', ''))
+
+    # 取得目前所有管線供下拉選單
+    all_pids = sorted(
+        edf['edited_pipeline_id'].dropna().astype(str).unique().tolist()
+    )
+    all_pids = [p for p in all_pids if p.strip()]
+
+    # ── 方式 A：複製目前點位新增下一點 ──────────────────
+    if sel_row is not None:
+        st.markdown('#### 方式 A｜複製目前點位，新增下一點')
+        cur_pid    = default_pid
+        cur_pno_v  = sel_row.get('edited_point_no_int')
+        try:
+            cur_pno_int = int(cur_pno_v) if cur_pno_v is not None else 0
+        except Exception:
+            cur_pno_int = 0
+        next_pno   = _next_point_no(edf, cur_pid)
+        next_raw_id = f'{cur_pid}.{next_pno}' if cur_pid else ''
+
+        st.caption(
+            f'管線：`{cur_pid}`　目前點：`{_v(sel_row.get("edited_point_no"))}`　'
+            f'→ 新點號：`{next_pno}`　識別碼：`{next_raw_id}`'
+        )
+
+        ka = f'modeA_{_sk(selected_key)}'
+        with st.form(key=f'form_modeA_{_sk(selected_key)}'):
+            ax, ay, az = st.columns(3)
+            a_x    = ax.text_input('X / E', value=_v(sel_row.get('edited_x')), key=f'{ka}_x')
+            a_y    = ay.text_input('Y / N', value=_v(sel_row.get('edited_y')), key=f'{ka}_y')
+            a_z    = az.text_input('Z / H', value=_v(sel_row.get('edited_z')), key=f'{ka}_z')
+            a_date = st.text_input('測量日期', value=default_date, key=f'{ka}_date')
+            a_note = st.text_area('備註', height=60, key=f'{ka}_note')
+            a_submit = st.form_submit_button(
+                f'➕ 新增至管線尾端（點號 {next_pno}）', type='primary', use_container_width=True
+            )
+
+        if a_submit:
+            if not a_x.strip() or not a_y.strip():
+                st.error('❌ 新增點位至少需填寫 X、Y 座標。')
+            elif not cur_pid:
+                st.error('❌ 管線識別碼為空，無法新增點位。')
+            else:
+                st.session_state.pending_manual_add = {
+                    'mode': 'append',
+                    'form': {
+                        'pipeline_id': cur_pid,
+                        'category':    default_cat,
+                        'raw_id':      next_raw_id,
+                        'point_no':    str(next_pno),
+                        'x': a_x, 'y': a_y, 'z': a_z,
+                        'date': a_date, 'note': a_note,
+                    },
+                    'insert_after': None,
+                }
+                st.rerun()
+
+        # ── 確認對話框 A ────────────────────────────────
+        pend = st.session_state.get('pending_manual_add')
+        if pend and pend.get('mode') == 'append' and pend['form']['pipeline_id'] == cur_pid:
+            fd = pend['form']
+            st.warning(
+                f'**確認新增點位？**\n\n'
+                f'管線：`{fd["pipeline_id"]}`　點號：`{fd["point_no"]}`　'
+                f'識別碼：`{fd["raw_id"]}`\n'
+                f'X：`{fd["x"]}`　Y：`{fd["y"]}`　Z：`{fd["z"]}`\n\n'
+                '此點位將納入分類表、Excel 與 GML 輸出，但**不會修改原始 CSV**。'
+            )
+            c1, c2 = st.columns(2)
+            if c1.button('✅ 確認新增', key=f'mA_yes_{ka}', type='primary', use_container_width=True):
+                new_edf, new_log, new_pk, msg = add_manual_point(
+                    st.session_state.edited_points_df,
+                    st.session_state.edit_log_df,
+                    pend['form'],
+                    insert_after_pno=pend.get('insert_after'),
+                )
+                st.session_state.edited_points_df = new_edf
+                st.session_state.edit_log_df      = new_log
+                st.session_state.selected_key     = new_pk
+                st.session_state.pending_manual_add = None
+                st.toast(f'✅ {msg}', icon='➕')
+                st.rerun()
+            if c2.button('❌ 取消', key=f'mA_no_{ka}', use_container_width=True):
+                st.session_state.pending_manual_add = None
+                st.rerun()
+
+        st.divider()
+
+        # ── 插入中間點位 ────────────────────────────────
+        with st.expander(f'🔀 插入點位（在第 {cur_pno_int} 點之後）', expanded=False):
+            st.caption(
+                f'在第 **{cur_pno_int}** 點之後插入新點，後續點位將自動重新編號。\n\n'
+                f'例如原本 1→2→3→4，在第 {cur_pno_int} 點後插入 → '
+                f'重新編號為 1→…→{cur_pno_int}→（新）→{cur_pno_int+1}→…'
+            )
+            ki = f'ins_{_sk(selected_key)}'
+            with st.form(key=f'form_ins_{_sk(selected_key)}'):
+                ix, iy, iz = st.columns(3)
+                i_x    = ix.text_input('X / E', key=f'{ki}_x')
+                i_y    = iy.text_input('Y / N', key=f'{ki}_y')
+                i_z    = iz.text_input('Z / H', key=f'{ki}_z')
+                i_date = st.text_input('測量日期', value=default_date, key=f'{ki}_date')
+                i_note = st.text_area('備註', height=60, key=f'{ki}_note')
+                i_sub  = st.form_submit_button(
+                    f'🔀 插入在第 {cur_pno_int} 點之後', type='primary', use_container_width=True
+                )
+
+            if i_sub:
+                if not i_x.strip() or not i_y.strip():
+                    st.error('❌ 新增點位至少需填寫 X、Y 座標。')
+                elif not cur_pid:
+                    st.error('❌ 管線識別碼為空。')
+                else:
+                    ins_pno = cur_pno_int + 1
+                    ins_raw_id = f'{cur_pid}.{ins_pno}' if cur_pid else ''
+                    st.session_state.pending_manual_add = {
+                        'mode': 'insert',
+                        'form': {
+                            'pipeline_id': cur_pid,
+                            'category':    default_cat,
+                            'raw_id':      ins_raw_id,
+                            'point_no':    str(ins_pno),
+                            'x': i_x, 'y': i_y, 'z': i_z,
+                            'date': i_date, 'note': i_note,
+                        },
+                        'insert_after': cur_pno_int,
+                    }
+                    st.rerun()
+
+            pend_i = st.session_state.get('pending_manual_add')
+            if pend_i and pend_i.get('mode') == 'insert' and pend_i['form']['pipeline_id'] == cur_pid:
+                fd = pend_i['form']
+                st.warning(
+                    f'**確認插入點位？**\n\n'
+                    f'管線：`{fd["pipeline_id"]}`　插入位置：第 {pend_i["insert_after"]} 點之後\n'
+                    f'新點號：`{fd["point_no"]}`　識別碼：`{fd["raw_id"]}`\n'
+                    f'X：`{fd["x"]}`　Y：`{fd["y"]}`　Z：`{fd["z"]}`\n\n'
+                    '⚠️ **後續點位將自動重新編號（點號 +1）。**\n'
+                    '此點位將納入分類表、Excel 與 GML 輸出，但**不會修改原始 CSV**。'
+                )
+                ci1, ci2 = st.columns(2)
+                if ci1.button('✅ 確認插入', key=f'ins_yes_{ki}', type='primary', use_container_width=True):
+                    new_edf, new_log, new_pk, msg = add_manual_point(
+                        st.session_state.edited_points_df,
+                        st.session_state.edit_log_df,
+                        pend_i['form'],
+                        insert_after_pno=pend_i['insert_after'],
+                    )
+                    st.session_state.edited_points_df = new_edf
+                    st.session_state.edit_log_df      = new_log
+                    st.session_state.selected_key     = new_pk
+                    st.session_state.pending_manual_add = None
+                    st.toast(f'✅ {msg}', icon='🔀')
+                    st.rerun()
+                if ci2.button('❌ 取消', key=f'ins_no_{ki}', use_container_width=True):
+                    st.session_state.pending_manual_add = None
+                    st.rerun()
+
+    # ── 方式 B：空白表單新增 ─────────────────────────────
+    st.markdown('#### 方式 B｜空白表單新增')
+    kb = 'modeB'
+
+    # 管線選擇
+    if all_pids:
+        pid_options = ['（手動輸入）'] + all_pids
+        sel_idx = 0
+        if default_pid and default_pid in all_pids:
+            sel_idx = all_pids.index(default_pid) + 1
+        chosen = st.selectbox('選擇管線識別碼', pid_options, index=sel_idx, key=f'{kb}_pid_sel')
+        if chosen == '（手動輸入）':
+            b_pid = st.text_input('手動輸入管線識別碼', key=f'{kb}_pid_input')
+        else:
+            b_pid = chosen
+    else:
+        b_pid = st.text_input('管線識別碼', key=f'{kb}_pid_input')
+
+    if b_pid.strip():
+        next_b = _next_point_no(edf, b_pid.strip())
+        st.caption(f'此管線目前最大點號：{next_b - 1}，新點號預設為 **{next_b}**')
+
+    with st.form(key=f'form_modeB_{kb}'):
+        b_cat  = st.text_input('類別碼', value=default_cat, key=f'{kb}_cat')
+        b_rid  = st.text_input('識別碼（留空自動產生）', key=f'{kb}_rid')
+        b_pno  = st.text_input('點號（留空自動產生）',    key=f'{kb}_pno')
+        bx, by, bz = st.columns(3)
+        b_x    = bx.text_input('X / E', key=f'{kb}_x')
+        b_y    = by.text_input('Y / N', key=f'{kb}_y')
+        b_z    = bz.text_input('Z / H', key=f'{kb}_z')
+        b_date = st.text_input('測量日期', value=default_date, key=f'{kb}_date',
+                                placeholder='YYYY-MM-DD 或原始格式')
+        b_note = st.text_area('備註', height=60, key=f'{kb}_note')
+        b_sub  = st.form_submit_button('➕ 建立空白點位', type='primary', use_container_width=True)
+
+    if b_sub:
+        b_pid_v = b_pid.strip()
+        if not b_pid_v:
+            st.error('❌ 請指定管線識別碼。')
+        elif not b_x.strip() or not b_y.strip():
+            st.error('❌ 新增點位至少需填寫 X、Y 座標。')
+        else:
+            # 點號衝突檢查
+            from src.v3_helpers import _has_duplicate_pno
+            pno_check = b_pno.strip()
+            try:
+                pno_check_int = int(pno_check) if pno_check else _next_point_no(edf, b_pid_v)
+            except ValueError:
+                pno_check_int = _next_point_no(edf, b_pid_v)
+            if _has_duplicate_pno(edf, b_pid_v, pno_check_int):
+                st.error(f'❌ 此管線已有點號 {pno_check_int}，請更改點號或留空自動產生。')
+            else:
+                auto_pno = str(pno_check_int)
+                auto_rid = b_rid.strip() or (f'{b_pid_v}.{auto_pno}' if b_pid_v else '')
+                st.session_state.pending_manual_add = {
+                    'mode': 'blank',
+                    'form': {
+                        'pipeline_id': b_pid_v,
+                        'category':    b_cat,
+                        'raw_id':      auto_rid,
+                        'point_no':    auto_pno,
+                        'x': b_x, 'y': b_y, 'z': b_z,
+                        'date': b_date, 'note': b_note,
+                    },
+                    'insert_after': None,
+                }
+                st.rerun()
+
+    pend_b = st.session_state.get('pending_manual_add')
+    if pend_b and pend_b.get('mode') == 'blank':
+        fd = pend_b['form']
+        st.warning(
+            f'**確認新增點位？**\n\n'
+            f'管線：`{fd["pipeline_id"]}`　點號：`{fd["point_no"]}`　'
+            f'識別碼：`{fd["raw_id"]}`\n'
+            f'X：`{fd["x"]}`　Y：`{fd["y"]}`　Z：`{fd["z"]}`\n\n'
+            '此點位將納入分類表、Excel 與 GML 輸出，但**不會修改原始 CSV**。'
+        )
+        cb1, cb2 = st.columns(2)
+        if cb1.button('✅ 確認新增', key='mB_yes', type='primary', use_container_width=True):
+            new_edf, new_log, new_pk, msg = add_manual_point(
+                st.session_state.edited_points_df,
+                st.session_state.edit_log_df,
+                pend_b['form'],
+                insert_after_pno=None,
+            )
+            st.session_state.edited_points_df = new_edf
+            st.session_state.edit_log_df      = new_log
+            st.session_state.selected_key     = new_pk
+            st.session_state.pending_manual_add = None
+            st.toast(f'✅ {msg}', icon='➕')
+            st.rerun()
+        if cb2.button('❌ 取消', key='mB_no', use_container_width=True):
+            st.session_state.pending_manual_add = None
+            st.rerun()
+
+
+# ============================================================
 # 右側大型編輯視窗
 # ============================================================
 
@@ -154,15 +438,17 @@ def render_edit_panel(edited_df, original_df, anomaly_set):
     row = edited_df[edited_df['point_key'] == selected_key].iloc[0]
     k   = _sk(selected_key)
 
-    is_anom = (row['_source_file'], row['_original_row']) in anomaly_set
-    is_mod  = bool(row.get('is_modified', False))
-    status  = str(row.get('review_status', ''))
+    is_anom   = (row['_source_file'], row['_original_row']) in anomaly_set
+    is_mod    = bool(row.get('is_modified', False))
+    is_manual = is_manual_point(row.to_dict())
+    status    = str(row.get('review_status', ''))
 
     badges = []
-    if is_anom:  badges.append('⚠️ 異常點位')
-    if is_mod:   badges.append('⚙️ 已修正')
-    if status == '排除':    badges.append('🚫 已排除')
-    elif status == '正常':  badges.append('✅ 正常')
+    if is_manual: badges.append('◆ 人工新增點位')
+    if is_anom:   badges.append('⚠️ 異常點位')
+    if is_mod and not is_manual: badges.append('⚙️ 已修正')
+    if status == '排除':     badges.append('🚫 已排除')
+    elif status == '正常':   badges.append('✅ 正常')
     elif status == '待確認': badges.append('❓ 待確認')
     if badges:
         st.markdown('　'.join(f'`{b}`' for b in badges))
@@ -185,8 +471,12 @@ def render_edit_panel(edited_df, original_df, anomaly_set):
             st.session_state.edit_log_df = new_log
             st.rerun()
     with qc3:
+        # 人工新增點位不支援還原（沒有原始 CSV 對應列）
+        restore_disabled = not is_mod or is_manual
+        restore_help     = '人工新增點位無法還原（不來自 CSV）' if is_manual else None
         if st.button('↩️ 還原此點', key=f'restore_{k}',
-                     disabled=not is_mod, use_container_width=True):
+                     disabled=restore_disabled, use_container_width=True,
+                     help=restore_help):
             new_edf, new_log = restore_point(
                 st.session_state.edited_points_df,
                 st.session_state.edit_log_df, selected_key, original_df)
@@ -379,6 +669,8 @@ def main():
         ('confirm_excl_cls',  False),
         ('pending_excl_cls',  []),
         ('app_mode',          '資料整理'),
+        ('pending_manual_add',       None),
+        ('show_manual_blank_form',   False),
         ('gml_result_text',   ''),
         ('gml_result_ok',     0),
         ('gml_result_errors', []),
@@ -458,8 +750,12 @@ def main():
                 c2.metric('管線數', count_pipelines(edf))
                 c1.metric('異常筆數', len(al))
                 c2.metric('重複記錄', len(dl))
-                n_excl_sb = int(edf.apply(_is_excl, axis=1).sum())
-                st.caption(f'管線數依「管線識別碼」唯一值統計　已排除 {n_excl_sb} 筆')
+                n_excl_sb   = int(edf.apply(_is_excl, axis=1).sum())
+                n_manual_sb = int((edf['_source_file'].astype(str) == '人工新增').sum())
+                sb_caption  = f'管線數依「管線識別碼」唯一值統計　已排除 {n_excl_sb} 筆'
+                if n_manual_sb:
+                    sb_caption += f'　◆ 人工新增 {n_manual_sb} 筆'
+                st.caption(sb_caption)
                 n_mod = int(edf['is_modified'].sum())
                 if n_mod:
                     st.info(f'⚙️ 已修正 {n_mod} 個點位')
@@ -581,11 +877,18 @@ def main():
 | 符號 | 意義 |
 |------|------|
 | ● 管線色圓形 | 一般點位 |
+| ◆ 綠色菱形 | 人工新增點位 |
 | ⭐ 橘色星星 | 已人工修正 |
 | ▲ 橘色三角 | 待確認 / 需廠商補測 |
 | ✕ 紅色 | 異常點位 |
 | ✕ 灰色 | 已排除 |
 | ○ 金色大圓 | 目前選取 |
+
+#### 新增人工點位
+在畫布點選任一點後，切換右側「**➕ 新增點位**」頁籤：
+- **方式 A**：複製選取點位，自動建立下一個點號
+- **方式 B**：空白表單，手動填寫所有欄位
+- **插入**：在目前點位之後插入，後續點位自動重新編號
 
 > 原始 CSV 永遠不會被修改。所有修正均寫入修正紀錄表，可完整追溯。
         """)
@@ -660,7 +963,14 @@ def _render_data_mode(original_df, anomaly_list, dup_list, anomaly_set):
             '｜ **點選畫布上的點位** 即可在右側編輯')
 
     with col_edit:
-        render_edit_panel(st.session_state.edited_points_df, original_df, anomaly_set)
+        edit_tab, add_tab = st.tabs(['📋 點位編輯', '➕ 新增點位'])
+        with edit_tab:
+            render_edit_panel(st.session_state.edited_points_df, original_df, anomaly_set)
+        with add_tab:
+            if not st.session_state.processed:
+                st.info('請先上傳 CSV 並完成處理後，再新增人工點位。')
+            else:
+                render_add_point_panel(st.session_state.edited_points_df)
 
     # ── 下方頁籤 ─────────────────────────────────
     st.divider()

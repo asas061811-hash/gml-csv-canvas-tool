@@ -12,6 +12,8 @@ import datetime
 import io
 import json
 import math
+import re as _re
+import uuid as _uuid_mod
 
 import openpyxl
 import pandas as pd
@@ -29,7 +31,7 @@ COLOR_PALETTE = [
 
 # ── 選項清單（供 app.py import）────────────────────────
 REVIEW_STATUS_OPTIONS  = ['未判讀', '正常', '待確認', '需廠商補測', '排除', '採用', '已修正']
-PROBLEM_TYPE_OPTIONS   = ['無', '點位偏移', '點位缺漏', '點位重複', '座標異常', '日期不一致', '點序錯誤', '手動排除', '其他']
+PROBLEM_TYPE_OPTIONS   = ['無', '點位偏移', '點位缺漏', '點位重複', '座標異常', '日期不一致', '點序錯誤', '手動排除', '人工新增點位', '其他']
 INCLUDE_RESULT_OPTIONS = ['是', '否']
 
 # ── 管線分類對照表（公共設施管線資料庫）──────────────
@@ -94,6 +96,219 @@ _IMMUTABLE_COLS = [
 def make_point_key(source_file, original_row, raw_id):
     """產生點位唯一識別碼（不受使用者編輯影響）。"""
     return f"{source_file or ''}||{original_row or ''}||{raw_id or ''}"
+
+
+def make_manual_point_key():
+    """產生人工新增點位的不可變識別碼。格式：manual_{timestamp}_{8位hex}"""
+    ts  = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    uid = _uuid_mod.uuid4().hex[:8]
+    return f'manual_{ts}_{uid}'
+
+
+def is_manual_point(row):
+    """判斷此列是否為人工新增點位（非來自原始 CSV）。"""
+    return str(row.get('_source_file', '')) == '人工新增'
+
+
+def _next_point_no(edited_df, pipeline_id):
+    """找出指定管線中目前最大整數點號，回傳 max+1（最少為 1）。"""
+    pid = str(pipeline_id or '').strip()
+    if not pid:
+        return 1
+    mask    = edited_df['edited_pipeline_id'].astype(str).str.strip() == pid
+    pipe_df = edited_df[mask]
+    if pipe_df.empty:
+        return 1
+    max_pno = 0
+    for _, row in pipe_df.iterrows():
+        v = row.get('edited_point_no_int')
+        try:
+            if v is not None and not (isinstance(v, float) and math.isnan(v)):
+                max_pno = max(max_pno, int(v))
+        except Exception:
+            pass
+    return max_pno + 1
+
+
+def _has_duplicate_pno(edited_df, pipeline_id, point_no_int):
+    """檢查指定管線是否已有相同整數點號。"""
+    pid  = str(pipeline_id or '').strip()
+    mask = edited_df['edited_pipeline_id'].astype(str).str.strip() == pid
+    for _, row in edited_df[mask].iterrows():
+        v = row.get('edited_point_no_int')
+        try:
+            if v is not None and not (isinstance(v, float) and math.isnan(v)):
+                if int(v) == point_no_int:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def add_manual_point(edited_df, edit_log_df, form_data, insert_after_pno=None):
+    """
+    新增一個人工點位到 edited_df，並寫入修正紀錄。
+
+    form_data 鍵：
+      pipeline_id, category, raw_id, point_no, x, y, z, d, date, note
+
+    insert_after_pno：
+      None  → 新增至管線尾端（點號 = 目前最大 + 1）
+      int   → 插入在此點號之後，後續點全部 +1 並更新識別碼末尾數字
+
+    回傳 (updated_edited_df, updated_edit_log_df, new_point_key, result_msg)
+    """
+    edited_df = edited_df.copy()
+
+    pid      = str(form_data.get('pipeline_id', '') or '').strip()
+    category = str(form_data.get('category',    '') or '').strip()
+    x_str    = str(form_data.get('x',           '') or '').strip()
+    y_str    = str(form_data.get('y',           '') or '').strip()
+    z_str    = str(form_data.get('z',           '') or '').strip()
+    date_str = str(form_data.get('date',        '') or '').strip()
+    note     = str(form_data.get('note',        '') or '')
+
+    # ── 決定新點號 ────────────────────────────────────
+    if insert_after_pno is not None:
+        new_pno_int = int(insert_after_pno) + 1
+        # 後續點全部 +1 並嘗試更新識別碼末尾數字
+        mask    = edited_df['edited_pipeline_id'].astype(str).str.strip() == pid
+        renumbered = 0
+        old_order, new_order = [], []
+        for idx in edited_df.index[mask]:
+            v = edited_df.loc[idx, 'edited_point_no_int']
+            try:
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    continue
+                vi = int(v)
+            except Exception:
+                continue
+            if vi >= new_pno_int:
+                old_order.append(vi)
+                new_vi = vi + 1
+                new_order.append(new_vi)
+                edited_df.loc[idx, 'edited_point_no_int'] = new_vi
+                edited_df.loc[idx, 'edited_point_no']     = str(new_vi)
+                # 嘗試更新識別碼末尾數字
+                old_rid = str(edited_df.loc[idx, 'edited_raw_id'] or '')
+                m = _re.match(r'^(.*?)(\d+)$', old_rid)
+                if m:
+                    edited_df.loc[idx, 'edited_raw_id'] = m.group(1) + str(new_vi)
+                edited_df.loc[idx, 'is_modified'] = True
+                renumbered += 1
+        result_msg = (
+            f'已在第 {insert_after_pno} 點之後插入新點（點號 {new_pno_int}），'
+            f'後續 {renumbered} 個點已重新編號。'
+        )
+        # 寫入重新編號紀錄
+        if old_order:
+            renumber_note = (
+                f'管線 {pid} 插入點位後重新編號：'
+                f'原點號 {"→".join(str(p) for p in sorted(old_order))} '
+                f'→ 新點號 {"→".join(str(p) for p in sorted(new_order))}'
+            )
+            log_renumber = {c: None for c in EDIT_LOG_COLS}
+            log_renumber.update({
+                '修正時間': _now_str(),
+                '動作類型': '插入點位後重新編號',
+                '原始_來源CSV': f'管線:{pid}',
+                '人工備註': renumber_note,
+                '是否納入成果': '',
+            })
+            edit_log_df = pd.concat(
+                [edit_log_df, pd.DataFrame([log_renumber])], ignore_index=True
+            )
+    else:
+        new_pno_int = _next_point_no(edited_df, pid)
+        result_msg  = f'已新增第 {new_pno_int} 點至管線 {pid} 尾端。'
+
+    pno_str = str(form_data.get('point_no', '') or '').strip() or str(new_pno_int)
+    try:
+        new_pno_int = int(pno_str)
+    except ValueError:
+        pass  # 保持原本計算值
+
+    # 識別碼：若未填則自動產生 {pid}.{pno}
+    raw_id = str(form_data.get('raw_id', '') or '').strip()
+    if not raw_id and pid:
+        raw_id = f'{pid}.{pno_str}'
+
+    # 產生 point_key
+    pk = make_manual_point_key()
+
+    x_val = safe_float(x_str)
+    y_val = safe_float(y_str)
+    z_val = safe_float(z_str)
+
+    # ── 建立新列（對齊 edited_df schema）────────────────
+    new_row = {
+        '_source_file':         '人工新增',
+        '_original_row':        '人工新增',
+        'raw_id':               raw_id,
+        'pipeline_id':          pid,
+        'point_no':             pno_str,
+        'point_no_int':         pd.array([new_pno_int], dtype=pd.Int64Dtype())[0],
+        'raw_category':         category,
+        'raw_x':                x_str,
+        'raw_y':                y_str,
+        'raw_z':                z_str,
+        'raw_date':             date_str,
+        'x_val':                x_val,
+        'y_val':                y_val,
+        'z_val':                z_val,
+        'point_key':            pk,
+        'edited_category':      category or None,
+        'edited_raw_id':        raw_id   or None,
+        'edited_source_file':   '人工新增',
+        'edited_original_row':  '人工新增',
+        'edited_pipeline_id':   pid      or None,
+        'edited_point_no':      pno_str  or None,
+        'edited_point_no_int':  pd.array([new_pno_int], dtype=pd.Int64Dtype())[0],
+        'edited_x':             x_str    or None,
+        'edited_y':             y_str    or None,
+        'edited_z':             z_str    or None,
+        'edited_date':          date_str or None,
+        'edited_x_val':         x_val,
+        'edited_y_val':         y_val,
+        'edited_z_val':         z_val,
+        'review_status':        '已修正',
+        'problem_type':         '人工新增點位',
+        'manual_note':          note,
+        'include_in_result':    '是',
+        'is_modified':          True,
+    }
+    # 補足 edited_df 中其他可能存在的欄位
+    for col in edited_df.columns:
+        if col not in new_row:
+            new_row[col] = None
+
+    new_row_df = pd.DataFrame([new_row])
+    # 對齊欄位順序
+    for col in edited_df.columns:
+        if col not in new_row_df.columns:
+            new_row_df[col] = None
+    edited_df = pd.concat([edited_df, new_row_df[edited_df.columns]], ignore_index=True)
+
+    # ── 寫修正紀錄 ────────────────────────────────────
+    after_snap = _row_snapshot(new_row, _SNAP_FIELDS)
+    log_row = {c: None for c in EDIT_LOG_COLS}
+    log_row.update({
+        '修正時間':      _now_str(),
+        'point_key':    pk,
+        '動作類型':     '人工新增點位',
+        '原始_來源CSV': '人工新增',
+        '原始_列號':    '人工新增',
+        '原始_識別碼':  raw_id,
+        '修改前_資料':  '',
+        '修改後_資料':  after_snap,
+        '判讀狀態':     '已修正',
+        '問題類型':     '人工新增點位',
+        '人工備註':     note or result_msg,
+        '是否納入成果': '是',
+    })
+    edit_log_df = pd.concat([edit_log_df, pd.DataFrame([log_row])], ignore_index=True)
+
+    return edited_df, edit_log_df, pk, result_msg
 
 
 def safe_float(val):
@@ -849,8 +1064,13 @@ def reverse_pipeline_order(edited_df, edit_log_df, pipeline_id):
 
 
 def clear_all_edits(edited_df, original_df, edit_log_df):
-    """還原所有人工修正至原始值，並寫入一筆清除紀錄。"""
+    """還原所有人工修正至原始值，並移除所有人工新增點位，寫入清除紀錄。"""
     edited_df = edited_df.copy()
+    # 移除人工新增點位（_source_file=='人工新增'）
+    manual_mask = edited_df['_source_file'].astype(str) == '人工新增'
+    n_manual    = int(manual_mask.sum())
+    if n_manual:
+        edited_df = edited_df[~manual_mask].reset_index(drop=True)
     n_mod = int(edited_df['is_modified'].sum())
     if n_mod == 0:
         return edited_df, edit_log_df
@@ -886,8 +1106,9 @@ def clear_all_edits(edited_df, original_df, edit_log_df):
     log_row.update({
         '修正時間': _now_str(),
         '動作類型': '清除全部修正',
-        '原始_來源CSV': f'（共清除 {n_mod} 筆修正）',
-        '人工備註': f'清除全部：共 {n_mod} 筆人工修正已還原',
+        '原始_來源CSV': f'（共清除 {n_mod} 筆修正，移除 {n_manual} 筆人工新增點位）',
+        '人工備註': (f'清除全部：{n_mod} 筆人工修正已還原，'
+                    f'{n_manual} 筆人工新增點位已移除'),
     })
     edit_log_df = pd.concat(
         [edit_log_df, pd.DataFrame([log_row])], ignore_index=True
@@ -912,13 +1133,18 @@ def _is_pending(row):
 
 def _hover_v3(row):
     """產生 v3 版 hover 文字。"""
-    status  = row.get('review_status', '')
-    problem = row.get('problem_type', '')
-    note    = row.get('manual_note', '')
-    incl    = row.get('include_in_result', '是')
-    is_mod  = bool(row.get('is_modified', False))
+    status   = row.get('review_status', '')
+    problem  = row.get('problem_type', '')
+    note     = row.get('manual_note', '')
+    incl     = row.get('include_in_result', '是')
+    is_mod   = bool(row.get('is_modified', False))
+    is_manual = is_manual_point(row)
 
-    parts = [
+    parts = []
+    if is_manual:
+        parts.append('◆ <b>人工新增點位</b>')
+        parts.append('─────────────────')
+    parts += [
         f"<b>識別碼：</b>{row.get('edited_raw_id', row.get('raw_id', ''))}",
         f"<b>管線：</b>{row.get('edited_pipeline_id', '')}",
         f"<b>點號：</b>{row.get('edited_point_no', '')}",
@@ -933,7 +1159,7 @@ def _hover_v3(row):
     if note:
         parts.append(f"<b>備註：</b>{note}")
     parts.append(f"<b>納入成果：</b>{incl}")
-    if is_mod:
+    if is_mod and not is_manual:
         parts.append('⚙️ <b>已人工修正</b>')
     parts += [
         '─────────────────',
@@ -1012,6 +1238,8 @@ def build_figure_v3(edited_df, anomaly_set=None, selected_key=None,
 
             texts.append(_hover_v3(row.to_dict()))
 
+            is_man = is_manual_point(row.to_dict())
+
             if sel:
                 symbols.append('circle-open')
                 clrs.append('#FFD700')
@@ -1023,6 +1251,12 @@ def build_figure_v3(edited_df, anomaly_set=None, selected_key=None,
                 clrs.append('rgba(120,120,120,0.35)')
                 sizes.append(9)
                 border_colors.append('rgba(120,120,120,0.35)')
+                border_widths.append(1.5)
+            elif is_man:
+                symbols.append('diamond')
+                clrs.append('#27AE60')
+                sizes.append(12)
+                border_colors.append('white')
                 border_widths.append(1.5)
             elif pend:
                 symbols.append('triangle-up')
@@ -1093,6 +1327,7 @@ def build_figure_v3(edited_df, anomaly_set=None, selected_key=None,
     # 狀態圖例
     for sym, clr, lbl in [
         ('circle',        '#1f77b4',              '管線點位'),
+        ('diamond',       '#27AE60',              '人工新增 ◆'),
         ('star',          '#E67E22',              '已修正 ⚙️'),
         ('triangle-up',   '#E67E22',              '待確認 ⚠️'),
         ('x',             'red',                  '異常 ✕'),
