@@ -1,5 +1,5 @@
 """
-app.py - GML 點位處理工具 V0.6 版
+app.py - GML 點位處理工具 Ver 1.0
 
 佈局：
   左側 sidebar ─ 功能模式切換（資料整理 / GML 輸出）+ 模式專屬控制
@@ -74,11 +74,15 @@ from src.attribute_merger import (
 from src.gml_generator import (
     TARGET_OPTIONS,
     TARGET_TAOYUAN,
+    TARGET_NLMA,
+    TARGET_STEC,
     ELEVATION_OPTIONS,
     ELEVATION_ABSOLUTE,
     generate_gml,
     is_implemented,
     export_gml_wide_csv_bytes,
+    validate_gml_input,
+    normalize_target_name,
 )
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config', 'rules.yaml')
@@ -641,7 +645,7 @@ def render_edit_panel(edited_df, original_df, anomaly_set):
 
 def main():
     st.set_page_config(
-        page_title='GML 點位處理工具 V0.6 版',
+        page_title='GML 點位處理工具 Ver 1.0',
         page_icon='📍',
         layout='wide',
         initial_sidebar_state='expanded',
@@ -671,11 +675,13 @@ def main():
         ('app_mode',          '資料整理'),
         ('pending_manual_add',       None),
         ('show_manual_blank_form',   False),
-        ('gml_result_text',   ''),
-        ('gml_result_ok',     0),
-        ('gml_result_errors', []),
-        ('gml_result_facility', ''),
-        ('gml_result_target', ''),
+        ('gml_result_text',       ''),
+        ('gml_result_ok',         0),
+        ('gml_result_errors',     []),
+        ('gml_result_pre_issues', []),
+        ('gml_result_facility',   ''),
+        ('gml_result_target',     ''),
+        ('gml_result_elevation',  ELEVATION_ABSOLUTE),
         ('attr_merged', {}),
         ('attr_code_dfs', {}),
     ]:
@@ -687,7 +693,7 @@ def main():
     # ════════════════════════════════════════════════
     with st.sidebar:
         st.title('📍 GML 點位處理工具')
-        st.caption('V0.6 版')
+        st.caption('Ver 1.0')
         st.divider()
 
         # ── 功能模式切換 ───────────────────────────
@@ -857,7 +863,7 @@ def main():
     # ════════════════════════════════════════════════
     if not st.session_state.processed and app_mode == '資料整理':
         st.markdown("""
-## 歡迎使用 GML 點位處理工具 V0.6 版
+## 歡迎使用 GML 點位處理工具 Ver 1.0
 
 ### 第一階段：資料整理
 1. 在左側 **① 上傳 CSV** — 可多選
@@ -942,7 +948,7 @@ def _render_data_mode(original_df, anomaly_list, dup_list, anomaly_set):
         event = st.plotly_chart(
             fig, use_container_width=True,
             config={'scrollZoom': True, 'displayModeBar': True,
-                    'toImageButtonOptions': {'format': 'png', 'filename': 'GML_點位畫布_v0_6',
+                    'toImageButtonOptions': {'format': 'png', 'filename': 'GML_點位畫布_Ver1_0',
                                              'height': 1000, 'width': 1600}},
             on_select='rerun', selection_mode='points', key='v3_canvas',
         )
@@ -1447,8 +1453,8 @@ def _render_tab_download(original_df, anomaly_list, dup_list, anomaly_set):
     n_mod_dl = int(st.session_state.edited_points_df['is_modified'].sum())
     n_log_dl = len(st.session_state.edit_log_df) if st.session_state.edit_log_df is not None else 0
     st.download_button(
-        f'📥 GML處理成果_v0_6.xlsx　（含 {n_mod_dl} 筆修正、{n_log_dl} 筆紀錄）',
-        data=v_bytes, file_name='GML處理成果_v0_6.xlsx', mime=_MIME_XLSX)
+        f'📥 GML處理成果_Ver1_0.xlsx　（含 {n_mod_dl} 筆修正、{n_log_dl} 筆紀錄）',
+        data=v_bytes, file_name='GML處理成果_Ver1_0.xlsx', mime=_MIME_XLSX)
     n_excl_dl = int(st.session_state.edited_points_df.apply(_is_excl, axis=1).sum())
     st.caption(
         f'修正後點位表 / 人工判讀紀錄表 / 分類表：僅含納入成果的點位。'
@@ -1512,8 +1518,8 @@ def _render_tab_download(original_df, anomaly_list, dup_list, anomaly_set):
             selected_key=None, canvas_height=800, show_excluded=False)
         html_str = pio.to_html(fig_dl, include_plotlyjs=True, full_html=True,
                                config={'scrollZoom': True})
-        st.download_button('📥 點位畫布_v0_6.html（修正後）',
-            data=html_str.encode('utf-8'), file_name='點位畫布_v0_6.html',
+        st.download_button('📥 點位畫布_Ver1_0.html（修正後）',
+            data=html_str.encode('utf-8'), file_name='點位畫布_Ver1_0.html',
             mime='text/html', use_container_width=True)
         st.caption('HTML 可離線用瀏覽器開啟，反映最新修正結果。')
 
@@ -1559,8 +1565,6 @@ def _render_gml_mode_tabs():
     gml_facility  = st.session_state.get('gml_facility_sb', '管線')
     gml_elevation = list(ELEVATION_OPTIONS.keys())[st.session_state.get('gml_elev_sb', 0)]
 
-    target_suffix_map = {'Taoyuan': '桃園市', 'NLMA': '國土署', 'STEC': '南科'}
-
     # ── Tab 0：GML 產製 ─────────────────────────────
     with gml_tabs[0]:
         st.subheader('GML 產製')
@@ -1578,7 +1582,7 @@ def _render_gml_mode_tabs():
         gml_cls_df = None
 
         if gml_source == '上傳 GML 專用寬表 CSV':
-            gml_csv_file = st.file_uploader('上傳 GML 專用寬表 CSV', type=['csv'], key='gml_csv_upload_v0_6')
+            gml_csv_file = st.file_uploader('上傳 GML 專用寬表 CSV', type=['csv'], key='gml_csv_upload_ver1_0')
             if gml_csv_file is not None:
                 try:
                     gml_cls_df = pd.read_csv(gml_csv_file, dtype=str, keep_default_na=False)
@@ -1604,31 +1608,43 @@ def _render_gml_mode_tabs():
                 st.download_button(
                     f'📥 下載 GML 專用寬表 CSV（{gml_facility}）',
                     data=csv_bytes, file_name=f'GML寬表_{gml_facility}.csv',
-                    mime='text/csv', key='dl_gml_wide_csv_v0_6')
+                    mime='text/csv', key='dl_gml_wide_csv_ver1_0')
         else:
             st.warning('請先完成資料整理，或切換資料來源為「上傳 GML 專用寬表 CSV」。')
 
         st.divider()
 
-        if not is_implemented(gml_target, gml_facility):
-            st.warning(f'⚠️ {TARGET_OPTIONS.get(gml_target, gml_target)} + {gml_facility}：'
-                       f'此規範或設施類型尚未實作。\n目前支援：桃園市 + 全部設施類型。')
-        elif gml_cls_df is not None and not gml_cls_df.empty:
-            if st.button('🚀 產生 GML', type='primary', key='btn_gen_gml_v0_6'):
+        # 國土署 / 南科提示
+        if gml_target in (TARGET_NLMA, TARGET_STEC):
+            st.info(
+                f'**{TARGET_OPTIONS[gml_target]}** 輸出為 E/N/Z 三維座標，不輸出 d 作為第四座標值。'
+                + ('　目前選擇「Z 為地面高程」模式，系統將自動計算 Z − d。'
+                   if gml_elevation != ELEVATION_ABSOLUTE else
+                   '　目前選擇「Z 已是絕對高程」模式。')
+            )
+
+        if gml_cls_df is not None and not gml_cls_df.empty:
+            if st.button('🚀 產生 GML', type='primary', key='btn_gen_gml_ver1_0'):
                 with st.spinner('正在產製 GML...'):
+                    # 先執行預先檢核
+                    pre_issues = validate_gml_input(gml_cls_df, gml_target, gml_facility, gml_elevation)
                     gml_text, gml_ok, gml_errors = generate_gml(
                         gml_cls_df, gml_target, gml_facility, gml_elevation)
 
                 st.session_state.gml_result_text = gml_text
                 st.session_state.gml_result_ok = gml_ok
                 st.session_state.gml_result_errors = gml_errors
+                st.session_state.gml_result_pre_issues = pre_issues
                 st.session_state.gml_result_facility = gml_facility
                 st.session_state.gml_result_target = gml_target
+                st.session_state.gml_result_elevation = gml_elevation
 
                 if gml_ok > 0:
                     st.success(f'GML 產製完成：成功 {gml_ok} 筆設施')
+                    if pre_issues:
+                        st.warning(f'有 {len(pre_issues)} 筆檢核提示，請查看「GML 檢核訊息」頁籤。')
                 else:
-                    st.error('GML 產製失敗：0 筆設施成功')
+                    st.error('GML 產製失敗：0 筆設施成功，請查看「GML 檢核訊息」頁籤。')
         elif gml_cls_df is not None and gml_cls_df.empty:
             st.info(f'目前資料中沒有「{gml_facility}」類型的點位。')
 
@@ -1653,17 +1669,16 @@ def _render_gml_mode_tabs():
         st.subheader('GML 下載')
         gml_text = st.session_state.get('gml_result_text', '')
         if gml_text:
-            target_label = target_suffix_map.get(st.session_state.gml_result_target,
-                                                  st.session_state.gml_result_target)
+            target_label = normalize_target_name(st.session_state.gml_result_target)
             facility_label = st.session_state.gml_result_facility
-            gml_filename = f'GML_{target_label}_{facility_label}.gml'
+            gml_filename = f'GML_{target_label}_{facility_label}_Ver1_0.gml'
 
             st.download_button(
                 f'📥 下載 {gml_filename}',
                 data=gml_text.encode('utf-8'),
                 file_name=gml_filename,
                 mime='application/gml+xml',
-                key='dl_gml_file_v0_6',
+                key='dl_gml_file_ver1_0',
                 use_container_width=True,
             )
             st.caption(f'檔案大小：{len(gml_text):,} 字元　'
@@ -1674,39 +1689,96 @@ def _render_gml_mode_tabs():
     # ── Tab 3：GML 檢核訊息 ─────────────────────────
     with gml_tabs[3]:
         st.subheader('GML 檢核訊息')
-        gml_ok = st.session_state.get('gml_result_ok', 0)
-        gml_errors = st.session_state.get('gml_result_errors', [])
-        gml_text = st.session_state.get('gml_result_text', '')
+        gml_ok       = st.session_state.get('gml_result_ok', 0)
+        gml_errors   = st.session_state.get('gml_result_errors', [])
+        gml_text     = st.session_state.get('gml_result_text', '')
+        pre_issues   = st.session_state.get('gml_result_pre_issues', [])
+        res_target   = st.session_state.get('gml_result_target', '')
+        res_facility = st.session_state.get('gml_result_facility', '')
+        res_elev     = st.session_state.get('gml_result_elevation', ELEVATION_ABSOLUTE)
 
         if not gml_text and not gml_errors:
             st.info('請先在「GML 產製」頁籤產生 GML。')
         else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric('成功產製', f'{gml_ok} 筆')
-
+            # ── 基本統計 ───
+            st.markdown(f"""
+**產製設定**
+- 目標規範：{TARGET_OPTIONS.get(res_target, res_target)}
+- 設施類型：{res_facility}
+- 高程模式：{ELEVATION_OPTIONS.get(res_elev, res_elev)}
+""")
+            n_excl_check = 0
             if st.session_state.processed:
                 n_excl_check = int(st.session_state.edited_points_df.apply(_is_excl, axis=1).sum())
-                c2.metric('排除資料', f'{n_excl_check} 筆')
-            c3.metric('產製異常', f'{len(gml_errors)} 筆')
 
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('成功產製', f'{gml_ok} 筆')
+            c2.metric('排除資料', f'{n_excl_check} 筆')
+            c3.metric('產製失敗', f'{len(gml_errors)} 筆')
+            c4.metric('檢核提示', f'{len(pre_issues)} 筆')
+
+            # ── 產製失敗明細 ───
             if gml_errors:
                 st.divider()
-                st.markdown('#### 異常明細')
+                st.markdown('#### ❌ 產製失敗明細')
                 err_df = pd.DataFrame(gml_errors)
+                err_df.columns = [c if c != 'error' else '錯誤原因' for c in err_df.columns]
                 st.dataframe(err_df, use_container_width=True, hide_index=True)
 
-                err_types = {}
+                err_types: dict = {}
                 for e in gml_errors:
                     reason = e.get('error', '未知')
-                    if '類別碼' in reason: err_types['類別碼缺漏或無效'] = err_types.get('類別碼缺漏或無效', 0) + 1
-                    elif '座標' in reason: err_types['座標缺漏'] = err_types.get('座標缺漏', 0) + 1
-                    else: err_types['其他'] = err_types.get('其他', 0) + 1
-
-                st.markdown('**異常類型統計：**')
+                    if '類別碼' in reason:
+                        k = '類別碼缺漏或無效'
+                    elif '座標' in reason:
+                        k = '缺少必要座標'
+                    elif '識別碼' in reason:
+                        k = '識別碼缺漏'
+                    else:
+                        k = '其他'
+                    err_types[k] = err_types.get(k, 0) + 1
+                st.markdown('**失敗類型統計：**')
                 for etype, cnt in err_types.items():
                     st.caption(f'• {etype}：{cnt} 筆')
-            elif gml_ok > 0:
+
+            # ── 預先檢核提示 ───
+            if pre_issues:
+                st.divider()
+                st.markdown('#### ⚠️ 檢核提示（不影響產製，建議確認）')
+                pre_df = pd.DataFrame(pre_issues)
+                pre_df = pre_df.rename(columns={'row': '列號', 'id': '識別碼',
+                                                 'level': '等級', 'message': '說明'})
+                st.dataframe(pre_df, use_container_width=True, hide_index=True)
+
+                # 警告分類統計
+                w_cats: dict = {}
+                for p in pre_issues:
+                    msg = p.get('message', '')
+                    if '類別碼' in msg:      k = '類別碼問題'
+                    elif '識別碼' in msg:    k = '識別碼缺漏'
+                    elif 'Z' in msg or 'd' in msg or '座標' in msg: k = '座標/高程問題'
+                    elif '定義文字' in msg:  k = '代碼欄位仍為定義文字'
+                    elif '日期' in msg:      k = '日期格式'
+                    else:                    k = '其他'
+                    w_cats[k] = w_cats.get(k, 0) + 1
+                st.markdown('**提示類型統計：**')
+                for wk, wc in w_cats.items():
+                    st.caption(f'• {wk}：{wc} 筆')
+
+            # ── 成功訊息 ───
+            if gml_ok > 0 and not gml_errors and not pre_issues:
                 st.success('✅ 所有設施均成功產製，無異常。')
+            elif gml_ok > 0 and not gml_errors:
+                st.info(f'✅ 產製成功 {gml_ok} 筆，但有 {len(pre_issues)} 筆檢核提示。')
+
+            # ── 國土署 / 南科 Z-d 說明 ───
+            if res_target in (TARGET_NLMA, TARGET_STEC) and res_elev == 'ground':
+                st.divider()
+                st.caption(
+                    f'**{TARGET_OPTIONS.get(res_target, "")} Z-d 模式**：'
+                    '輸出座標已套用「Z 地面高程 − d 埋設深度」計算為絕對管頂高程。'
+                    '請確認 d 值正確後再提交 GML。'
+                )
 
 
 if __name__ == '__main__':

@@ -1,9 +1,8 @@
 """
-gml_generator.py - GML 產製引擎
+gml_generator.py - GML 產製引擎 Ver 1.0
 
 將修正後點位資料或 GML 專用寬表 CSV 轉換為 GML XML 格式。
-支援目標規範：桃園市、國土署、南科/世曦。
-第一版完整實作：桃園市 + 管線。
+支援目標規範：桃園市、國土署、南科/世曦（全設施類型）。
 """
 
 import io
@@ -33,22 +32,25 @@ ELEVATION_OPTIONS = {
     ELEVATION_GROUND: 'Z 為地面高程，輸出 Z − d',
 }
 
-# 目前已實作的組合
+_FACILITY_TYPES_ALL = ['管線', '人手孔', '開關閥', '消防栓', '電桿', '號誌', '其他設施', '維護口', '場站']
+
+# Ver 1.0：三種規範均支援全部設施類型
 _IMPLEMENTED = {
-    (TARGET_TAOYUAN, '管線'),
-    (TARGET_TAOYUAN, '人手孔'),
-    (TARGET_TAOYUAN, '開關閥'),
-    (TARGET_TAOYUAN, '消防栓'),
-    (TARGET_TAOYUAN, '電桿'),
-    (TARGET_TAOYUAN, '號誌'),
-    (TARGET_TAOYUAN, '其他設施'),
-    (TARGET_TAOYUAN, '維護口'),
-    (TARGET_TAOYUAN, '場站'),
+    (t, f)
+    for t in (TARGET_TAOYUAN, TARGET_NLMA, TARGET_STEC)
+    for f in _FACILITY_TYPES_ALL
 }
 
 
 def is_implemented(target, facility_type):
+    if facility_type == '全部':
+        return True
     return (target, facility_type) in _IMPLEMENTED
+
+
+def normalize_target_name(target):
+    """回傳適合用於檔名的目標規範短名稱。"""
+    return {TARGET_TAOYUAN: '桃園市', TARGET_NLMA: '國土署', TARGET_STEC: '南科世曦'}.get(target, target)
 
 
 # ============================================================
@@ -382,14 +384,14 @@ def generate_gml(cls_df, target=TARGET_TAOYUAN, facility_type='管線',
         # 取得 GML schema
         feature_schema = get_schema_for_tag(tag_name, cat_code, target)
 
-        # 座標維度
-        srs_dim = '3'
+        # 座標維度（桃園市輸出 XYZD 四維；其餘三維）
+        srs_dim = '4' if target == TARGET_TAOYUAN else '3'
 
         # geometry 節點
         if geom_type == 'LineString':
             pos_tag = 'gml:posList'
         else:
-            pos_tag = 'gml:coordinates'
+            pos_tag = 'gml:pos'
 
         # 組裝 XML
         lines.append('    <gml:featureMember>')
@@ -415,10 +417,11 @@ def generate_gml(cls_df, target=TARGET_TAOYUAN, facility_type='管線',
             is_empty = (val_str == '' or val_str.lower() == 'empty')
 
             if field == '設置日期':
+                formatted_date = format_date_for_target(val_str, target) if not is_empty else ''
                 lines.append(f'            <設置日期>')
                 lines.append(f'                <gml:TimeInstant>')
-                if not is_empty:
-                    lines.append(f'                    <gml:timePosition>{_xml_escape(val_str)}</gml:timePosition>')
+                if formatted_date:
+                    lines.append(f'                    <gml:timePosition>{_xml_escape(formatted_date)}</gml:timePosition>')
                 else:
                     lines.append(f'                    <gml:timePosition/>')
                 lines.append(f'                </gml:TimeInstant>')
@@ -446,6 +449,110 @@ def _xml_escape(s):
              .replace('>', '&gt;')
              .replace('"', '&quot;')
              .replace("'", '&apos;'))
+
+
+# ============================================================
+# 8. format_date_for_target - 依規範轉換日期格式
+# ============================================================
+
+def format_date_for_target(date_value, target=TARGET_TAOYUAN):
+    """
+    桃園市 / 國土署：輸出 yyyy-MM-dd。
+    南科 / 世曦：輸出 yyyy/MM/dd。
+    無法解析則原樣回傳（呼叫端自行放入 timePosition 或留空）。
+    """
+    s = str(date_value or '').strip()
+    if not s or s.lower() == 'empty':
+        return ''
+
+    # 嘗試解析常見格式
+    import datetime as _dt
+    for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%Y%m%d', '%d/%m/%Y', '%m/%d/%Y'):
+        try:
+            d = _dt.datetime.strptime(s, fmt).date()
+            if target == TARGET_STEC:
+                return d.strftime('%Y/%m/%d')
+            return d.strftime('%Y-%m-%d')
+        except ValueError:
+            pass
+    # 無法解析，原樣回傳
+    return s
+
+
+# ============================================================
+# 9. validate_gml_input - 預先檢核資料
+# ============================================================
+
+def validate_gml_input(cls_df, target=TARGET_TAOYUAN, facility_type='管線',
+                       elevation_mode=ELEVATION_ABSOLUTE):
+    """
+    預先檢核分類表資料，回傳檢核問題清單。
+    不會阻擋 generate_gml；供 UI 顯示提示用。
+    回傳 list of dict: {row, id, level('warning'/'error'), message}
+    """
+    issues = []
+    if cls_df is None or cls_df.empty:
+        return issues
+
+    is_pipeline = (facility_type == '管線')
+    needs_z = (target in (TARGET_NLMA, TARGET_STEC)) or is_pipeline
+    needs_d = (elevation_mode == ELEVATION_GROUND)
+    code_fields = ['使用狀態', '資料狀態', '管線型態', '作業區分', '尺寸單位', '壓力區分']
+
+    for idx, row in cls_df.iterrows():
+        r = row.to_dict()
+        rid = str(r.get('識別碼', '') or '')
+        cat = str(r.get('類別碼', '') or '').strip()
+
+        if not cat or len(cat) != 7 or not cat.isdigit():
+            issues.append({'row': idx, 'id': rid, 'level': 'error', 'message': f'類別碼無效：{cat}'})
+            continue
+
+        if not rid:
+            issues.append({'row': idx, 'id': rid, 'level': 'warning', 'message': '識別碼為空'})
+
+        # 座標檢核
+        if is_pipeline:
+            x1 = _safe_float(r.get('第1點X'))
+            y1 = _safe_float(r.get('第1點Y'))
+            z1 = _safe_float(r.get('第1點Z'))
+            d1 = _safe_float(r.get('第1點d') or r.get('起點埋設深度'))
+            if x1 is None or y1 is None:
+                issues.append({'row': idx, 'id': rid, 'level': 'error', 'message': '缺少第1點 XY 座標'})
+            if needs_z and z1 is None:
+                issues.append({'row': idx, 'id': rid, 'level': 'warning', 'message': '缺少 Z 值，將以 0 代入'})
+            if needs_d and d1 is None:
+                issues.append({'row': idx, 'id': rid, 'level': 'warning', 'message': 'Z 為地面高程模式，但缺少 d（埋設深度），將以 0 代入'})
+        else:
+            x = _safe_float(r.get('X'))
+            y = _safe_float(r.get('Y'))
+            z = _safe_float(r.get('Z'))
+            d = _safe_float(r.get('d') or r.get('埋設深度') or r.get('孔深'))
+            if x is None or y is None:
+                issues.append({'row': idx, 'id': rid, 'level': 'error', 'message': '缺少 XY 座標'})
+            if needs_z and z is None:
+                issues.append({'row': idx, 'id': rid, 'level': 'warning', 'message': '缺少 Z 值，將以 0 代入'})
+            if needs_d and d is None:
+                issues.append({'row': idx, 'id': rid, 'level': 'warning', 'message': 'Z 為地面高程模式，但缺少 d（埋設深度），將以 0 代入'})
+
+        # 代碼欄位是否仍為定義文字
+        _DEFINITION_KEYWORDS = ['正常', '停用', '汙水', '雨水', '公釐', '新設', '廢除', '已知', '未知']
+        for cf in code_fields:
+            v = str(r.get(cf, '') or '').strip()
+            if v and any(kw in v for kw in _DEFINITION_KEYWORDS):
+                issues.append({'row': idx, 'id': rid, 'level': 'warning',
+                                'message': f'欄位「{cf}」值「{v}」疑似定義文字，GML 應使用代碼版'})
+                break  # 每列最多報一次
+
+        # 日期格式
+        date_val = str(r.get('設置日期', '') or '').strip()
+        if date_val and date_val.lower() != 'empty':
+            formatted = format_date_for_target(date_val, target)
+            if formatted == date_val and target == TARGET_STEC and '-' in date_val:
+                issues.append({'row': idx, 'id': rid, 'level': 'warning',
+                                'message': f'南科/世曦日期格式自動轉為 yyyy/MM/dd：{date_val} → {formatted}'})
+
+    return issues
 
 
 # ============================================================
