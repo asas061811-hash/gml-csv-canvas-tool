@@ -1,12 +1,15 @@
 """
-v3_helpers.py - 第三版輔助模組
+v3_helpers.py - 第三版輔助模組 V0.6.1
 
 提供：
   - 可編輯點位表 (edited_points_df) 初始化
   - v3 版本 Plotly 畫布建構（支援點選、per-point 樣式）
   - 修正紀錄表 (edit_log_df) 管理
   - 多工作表 Excel 匯出
+  - 人工新增點位功能 (add_manual_point)
 """
+
+__version__ = '0.6.1'
 
 import datetime
 import io
